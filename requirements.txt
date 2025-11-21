@@ -6,4 +6,4 @@ torch
 huggingface-hub
 accelerate
 streamlit>=1.25
-gpt4all>=1.1.0  # optional but recommended for local LLM use
+requests>=2.28

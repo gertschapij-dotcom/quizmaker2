@@ -1,19 +1,39 @@
-# ===========================================================
 # AI Quiz Generator — Streamlit Webapp (FREE, NO API KEYS)
-# ===========================================================
+# Save as app.py and run with: streamlit run app.py
 
 import streamlit as st
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer, util
 import spacy
+import sys
 
 # -----------------------------------------------------------
 # LOAD MODELS (FREE OPEN SOURCE)
 # -----------------------------------------------------------
 @st.cache_resource
 def load_models():
-    nlp = spacy.load("en_core_web_sm")
-    quiz_model = pipeline("text-generation", model="HuggingFaceH4/zephyr-7b-alpha")
+    # Ensure spaCy English model is available
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        # Try to download the model if missing
+        try:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
+            nlp = spacy.load("en_core_web_sm")
+        except Exception as e:
+            st.error(f"Could not load or download spaCy model: {e}")
+            raise
+
+    # WARNING: the text-generation model specified may be large and require GPU.
+    # Replace with a smaller or local model if needed.
+    try:
+        quiz_model = pipeline("text-generation", model="HuggingFaceH4/zephyr-7b-alpha")
+    except Exception as e:
+        st.error(f"Could not load text-generation model: {e}")
+        # Re-raise so the user can see the full traceback in logs
+        raise
+
     feedback_model = SentenceTransformer("all-MiniLM-L6-v2")
     return nlp, quiz_model, feedback_model
 
@@ -69,6 +89,7 @@ def check_answer(correct_answer, user_answer):
 # -----------------------------------------------------------
 # STREAMLIT UI
 # -----------------------------------------------------------
+st.set_page_config(page_title="AI Quiz Generator", layout="centered")
 st.title("🤖 AI Quiz Generator (Gratis Versie)")
 st.write("Maak automatisch quizvragen op basis van lesmateriaal **óf** een onderwerp.")
 
@@ -88,10 +109,12 @@ if mode == "Quiz uit lesmateriaal":
             st.warning("Voer eerst lesmateriaal in.")
         else:
             st.subheader("Meerkeuzevragen")
-            st.write(make_mc_questions(text))
+            with st.spinner("Genereer meerkeuzevragen..."):
+                st.write(make_mc_questions(text))
 
             st.subheader("Open vragen")
-            st.write(make_open_questions(text))
+            with st.spinner("Genereer open vragen..."):
+                st.write(make_open_questions(text))
 
 
 # -----------------------------------------------------------
@@ -105,10 +128,12 @@ if mode == "Quiz over een onderwerp (zonder tekst)":
             st.warning("Voer een onderwerp in.")
         else:
             st.subheader(f"Quiz over: {topic}")
-            st.write(make_mc_questions(topic))
+            with st.spinner("Genereer meerkeuzevragen..."):
+                st.write(make_mc_questions(topic))
 
             st.subheader("Open vragen")
-            st.write(make_open_questions(topic))
+            with st.spinner("Genereer open vragen..."):
+                st.write(make_open_questions(topic))
 
 
 # -----------------------------------------------------------
@@ -124,7 +149,8 @@ if st.button("Geef feedback"):
     if correct.strip() == "" or user.strip() == "":
         st.warning("Vul beide velden in.")
     else:
-        st.write(check_answer(correct, user))
+        with st.spinner("Controleer antwoord..."):
+            st.write(check_answer(correct, user))
 
 st.divider()
 st.caption("Made with ❤️ — volledig gratis, open-source modellen.")

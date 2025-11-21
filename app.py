@@ -1,7 +1,7 @@
 # AI Quiz Generator — Streamlit Webapp (FREE, NO API KEYS)
 # Save this file as app.py and run with: streamlit run app.py
-# If you previously saved the file with the name "code" (no .py extension)
-# Streamlit will complain "not a valid python script". Rename the file to app.py.
+# This version prefers instruction-tuned models (Flan-T5) and uses clearer prompts
+# to avoid the model echoing the instructions or producing gibberish.
 
 import streamlit as st
 from transformers import pipeline
@@ -24,20 +24,28 @@ def load_models():
             subprocess.check_call([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
             nlp = spacy.load("en_core_web_sm")
         except Exception as e:
-            # If spaCy fails, we continue but set nlp to None
             nlp = None
             st.warning(f"spaCy model could not be loaded: {e}")
 
-    # Text-generation model
-    # NOTE: the originally suggested model (HuggingFaceH4/zephyr-7b-alpha) is very large and
-    # may fail on machines without sufficient memory or GPU.
-    # We'll try a smaller default model that is more likely to run on CPU.
-    text_model = None
+    # Prefer instruction-tuned models (text2text) first
     text_pipeline = None
+    text_pipeline_task = None
+    text_model = None
     tried_models = []
-    for model_name in ["distilgpt2", "gpt2", "HuggingFaceH4/zephyr-7b-alpha"]:
+
+    model_candidates = [
+        ("google/flan-t5-small", "text2text-generation"),
+        ("google/flan-t5-base", "text2text-generation"),
+        # fallback to autoregressive models if T5 not available
+        ("distilgpt2", "text-generation"),
+        ("gpt2", "text-generation"),
+    ]
+
+    for model_name, task in model_candidates:
         try:
-            text_pipeline = pipeline("text-generation", model=model_name)
+            # create pipeline for the task
+            text_pipeline = pipeline(task, model=model_name)
+            text_pipeline_task = task
             text_model = model_name
             break
         except Exception as e:
@@ -45,8 +53,9 @@ def load_models():
             text_pipeline = None
 
     if text_pipeline is None:
-        st.warning("No text-generation model could be loaded. The app will use a simple fallback generator.")
-        # keep text_pipeline as None and handle fallback elsewhere
+        st.warning(
+            "No text-generation model could be loaded. The app will use a simple fallback generator."
+        )
 
     # Sentence-transformers for semantic similarity (feedback)
     feedback_model = None
@@ -56,26 +65,46 @@ def load_models():
         st.warning(f"Could not load SentenceTransformer model: {e}")
         feedback_model = None
 
-    return nlp, text_pipeline, feedback_model
+    return nlp, text_pipeline, feedback_model, text_pipeline_task
 
 
-nlp, quiz_model, feedback_model = load_models()
+# Unpack loaded models (quiz_model may be None if none could be loaded)
+nlp, quiz_model, feedback_model, quiz_model_task = load_models()
 
 
-# Wrapper to generate text consistently whether the pipeline loaded or not.
+# -----------------------------------------------------------
+# GENERATION HELPERS
+# -----------------------------------------------------------
 def generate_text(prompt, max_new_tokens=200):
+    """
+    Use the loaded pipeline to generate text. If no pipeline is available,
+    fall back to a simple deterministic generator so the app still shows output.
+    """
     if quiz_model is not None:
         try:
-            out = quiz_model(prompt, max_new_tokens=max_new_tokens)
-            # models return a list of dicts with 'generated_text'
-            if isinstance(out, list) and len(out) > 0 and "generated_text" in out[0]:
-                return out[0]["generated_text"].strip()
-            # fallback if the structure is different
-            return str(out)
+            # Use conservative generation settings to reduce repetition/gibberish.
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": True,
+                "temperature": 0.25,  # low temp -> less random nonsense
+                "top_p": 0.9,
+            }
+            out = quiz_model(prompt, **gen_kwargs)
+            # pipeline returns a list of dicts with 'generated_text'
+            if isinstance(out, list) and len(out) > 0:
+                first = out[0]
+                # Some pipelines (different versions) may return 'generated_text' or 'text'
+                if "generated_text" in first:
+                    return first["generated_text"].strip()
+                elif "text" in first:
+                    return first["text"].strip()
+                else:
+                    return str(first)
+            return str(out).strip()
         except Exception:
-            # catch runtime errors from transformers
+            # Show the traceback in the Streamlit UI so you can debug in logs
             traceback_str = traceback.format_exc()
-            st.error("Text-generation model crashed while generating text. See logs.")
+            st.error("Text-generation model crashed while generating text. See trace below.")
             st.text_area("Model error trace", traceback_str, height=200)
             return fallback_generator(prompt, max_new_tokens)
     else:
@@ -83,18 +112,20 @@ def generate_text(prompt, max_new_tokens=200):
 
 
 def fallback_generator(prompt, max_new_tokens):
-    # Simple, deterministic fallback so the app still demonstrates output
-    # This produces readable (but simple) questions if no heavy model is available.
-    # It inspects the prompt to decide whether to create MC or open questions.
-    lines = prompt.strip().splitlines()
+    """
+    Very simple deterministic fallback so the UI still shows plausible output
+    when no model is available.
+    """
     # try to find amount in prompt (simple heuristic)
     amount = 4
     for token in prompt.split():
         if token.isdigit():
-            amount = int(token)
-            break
+            try:
+                amount = int(token)
+                break
+            except Exception:
+                pass
 
-    # If the word "meerkeuze" or "multiple choice" is in prompt, make MC-style output
     if "meerkeuze" in prompt.lower() or "multiple choice" in prompt.lower():
         out_lines = []
         for i in range(amount):
@@ -106,7 +137,6 @@ def fallback_generator(prompt, max_new_tokens):
             out_lines.append("")  # blank line
         return "\n".join(out_lines)
     else:
-        # open questions fallback
         out_lines = []
         for i in range(amount):
             out_lines.append(f"{i+1}. Noem één belangrijk punt over het onderwerp.")
@@ -117,28 +147,24 @@ def fallback_generator(prompt, max_new_tokens):
 # QUESTION GENERATION FUNCTIONS
 # -----------------------------------------------------------
 def make_mc_questions(text, amount=4):
-    prompt = f"""
-Maak {amount} meerkeuzevragen over deze tekst OF over dit onderwerp.
-Zorg bij elke vraag voor:
-- 1 juist antwoord
-- 3 foute antwoorden
-- duidelijke nummering
-
-Invoer:
-{text}
-"""
+    # Use a clear instruction-style prompt that T5 and other instruction models follow well.
+    prompt = (
+        "Opdracht: Maak multiple choice-vragen.\n"
+        f"Invoer: Maak {amount} meerkeuzevragen over deze tekst of dit onderwerp. "
+        "Voor elke vraag: 1 juist antwoord en 3 foute antwoorden. Gebruik duidelijke nummering.\n"
+        f"Tekst:\n{text}\n\nAntwoord:"
+    )
     out = generate_text(prompt, max_new_tokens=300)
     return out.strip()
 
 
 def make_open_questions(text, amount=4):
-    prompt = f"""
-Maak {amount} open toetsvragen gebaseerd op deze tekst OF dit onderwerp.
-Geef GEEN antwoorden. Alleen de vragen.
-
-Invoer:
-{text}
-"""
+    prompt = (
+        "Opdracht: Maak open vragen.\n"
+        f"Invoer: Maak {amount} open toetsvragen gebaseerd op deze tekst of dit onderwerp. "
+        "Geef GEEN antwoorden, alleen de vragen. Gebruik duidelijke nummering.\n"
+        f"Tekst:\n{text}\n\nAntwoord:"
+    )
     out = generate_text(prompt, max_new_tokens=200)
     return out.strip()
 

@@ -1,0 +1,7 @@
+streamlit
+transformers
+sentence-transformers
+spacy
+torch
+huggingface-hub
+accelerate

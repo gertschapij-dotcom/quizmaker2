@@ -1,0 +1,130 @@
+# ===========================================================
+# AI Quiz Generator — Streamlit Webapp (FREE, NO API KEYS)
+# ===========================================================
+
+import streamlit as st
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+import spacy
+
+# -----------------------------------------------------------
+# LOAD MODELS (FREE OPEN SOURCE)
+# -----------------------------------------------------------
+@st.cache_resource
+def load_models():
+    nlp = spacy.load("en_core_web_sm")
+    quiz_model = pipeline("text-generation", model="HuggingFaceH4/zephyr-7b-alpha")
+    feedback_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return nlp, quiz_model, feedback_model
+
+nlp, quiz_model, feedback_model = load_models()
+
+# -----------------------------------------------------------
+# QUESTION GENERATION FUNCTIONS
+# -----------------------------------------------------------
+
+def make_mc_questions(text, amount=4):
+    prompt = f"""
+    Maak {amount} meerkeuzevragen over deze tekst OF over dit onderwerp.
+    Zorg bij elke vraag voor:
+    - 1 juist antwoord
+    - 3 foute antwoorden
+    - duidelijke nummering
+
+    Invoer:
+    {text}
+    """
+    out = quiz_model(prompt, max_new_tokens=500)[0]["generated_text"]
+    return out.strip()
+
+
+def make_open_questions(text, amount=4):
+    prompt = f"""
+    Maak {amount} open toetsvragen gebaseerd op deze tekst OF dit onderwerp.
+    Geef GEEN antwoorden. Alleen de vragen.
+
+    Invoer:
+    {text}
+    """
+    out = quiz_model(prompt, max_new_tokens=300)[0]["generated_text"]
+    return out.strip()
+
+
+# -----------------------------------------------------------
+# SEMANTIC FEEDBACK FOR OPEN ANSWERS
+# -----------------------------------------------------------
+def check_answer(correct_answer, user_answer):
+    emb1 = feedback_model.encode(correct_answer, convert_to_tensor=True)
+    emb2 = feedback_model.encode(user_answer, convert_to_tensor=True)
+    score = util.pytorch_cos_sim(emb1, emb2).item()
+
+    if score > 0.85:
+        return f"✅ Goed! (similarity: {score:.2f})"
+    elif score > 0.65:
+        return f"⚠️ Bijna goed — je mist wat details. (similarity: {score:.2f})"
+    else:
+        return f"❌ Niet correct — grote verschillen. (similarity: {score:.2f})"
+
+
+# -----------------------------------------------------------
+# STREAMLIT UI
+# -----------------------------------------------------------
+st.title("🤖 AI Quiz Generator (Gratis Versie)")
+st.write("Maak automatisch quizvragen op basis van lesmateriaal **óf** een onderwerp.")
+
+mode = st.radio(
+    "Kies een modus:",
+    ["Quiz uit lesmateriaal", "Quiz over een onderwerp (zonder tekst)"]
+)
+
+# -----------------------------------------------------------
+# MODE A — TEXT INPUT
+# -----------------------------------------------------------
+if mode == "Quiz uit lesmateriaal":
+    text = st.text_area("Plak je lesmateriaal hieronder:")
+
+    if st.button("Genereer quiz"):
+        if text.strip() == "":
+            st.warning("Voer eerst lesmateriaal in.")
+        else:
+            st.subheader("Meerkeuzevragen")
+            st.write(make_mc_questions(text))
+
+            st.subheader("Open vragen")
+            st.write(make_open_questions(text))
+
+
+# -----------------------------------------------------------
+# MODE B — QUIZ WITHOUT TEXT
+# -----------------------------------------------------------
+if mode == "Quiz over een onderwerp (zonder tekst)":
+    topic = st.text_input("Voer een onderwerp in (bijv. Biologie, WO2, Python).")
+
+    if st.button("Genereer quiz over onderwerp"):
+        if topic.strip() == "":
+            st.warning("Voer een onderwerp in.")
+        else:
+            st.subheader(f"Quiz over: {topic}")
+            st.write(make_mc_questions(topic))
+
+            st.subheader("Open vragen")
+            st.write(make_open_questions(topic))
+
+
+# -----------------------------------------------------------
+# FEEDBACK SECTION
+# -----------------------------------------------------------
+st.divider()
+st.header("📝 Antwoord Feedback Checker (Open Vragen)")
+
+correct = st.text_input("Modelantwoord (juiste antwoord):")
+user = st.text_input("Jouw antwoord:")
+
+if st.button("Geef feedback"):
+    if correct.strip() == "" or user.strip() == "":
+        st.warning("Vul beide velden in.")
+    else:
+        st.write(check_answer(correct, user))
+
+st.divider()
+st.caption("Made with ❤️ — volledig gratis, open-source modellen.")

@@ -1,22 +1,32 @@
 """
-Streamlit Quiz App using Google Generative AI (preferred if you supply an API key) or a built-in fallback.
+Streamlit Quiz App — uses a fixed Google Generative model (text-bison-001) when a Google API key is available.
+The Google API key is NOT requested in the web UI. The app will look for the key in this order:
+  1) st.secrets["GOOGLE_API_KEY"]  (recommended for Streamlit Cloud / local .streamlit/secrets.toml)
+  2) environment variable GOOGLE_API_KEY
+If no key is found, the app falls back to a built-in self-contained generator/grader.
 
-How it works:
-- Accepts either an uploaded context text file OR a short subject line.
-- Lets user choose difficulty, number of questions, and question type (multiple choice, open answer, mix).
-- If you provide a Google Generative API key in the sidebar, the app will call the Google Generative API (e.g. text-bison-001) to generate quizzes and grade open answers.
-- If no API key is provided (or calls fail), the app uses a simple self-contained fallback generator & grader.
-- Everything lives inside this single file; to run:
-    pip install -r requirements.txt
-    streamlit run streamlit_app.py
+How to provide the API key securely:
+- For Streamlit Cloud: add GOOGLE_API_KEY in the app's Secrets (recommended).
+- Locally: create a file .streamlit/secrets.toml with:
+    GOOGLE_API_KEY="your_key_here"
+  or set an environment variable:
+    export GOOGLE_API_KEY="your_key_here"
+
+This file intentionally does not expose a model choice in the UI — it always uses "text-bison-001".
 """
 from dataclasses import dataclass
 import json
 import random
 import re
+import os
 import requests
 import streamlit as st
 from typing import Any, Dict, List, Optional
+
+# -----------------------
+# Configuration (fixed model)
+# -----------------------
+GOOGLE_MODEL = "text-bison-001"  # fixed model, no UI option to change
 
 # -----------------------
 # Data structures
@@ -31,17 +41,14 @@ class QuizQuestion:
     explanation: str  # detailed explanation / answer key
 
 # -----------------------
-# JSON extraction helper
+# Helper: JSON extraction
 # -----------------------
 def extract_json(text: str) -> Optional[str]:
-    """
-    Attempt to extract a JSON object/array from text.
-    Returns the JSON substring if found, else None.
-    """
+    """Attempt to find the first valid JSON object/array in text."""
     if not text:
         return None
     candidates = []
-    # find {...} spans
+    # {...} spans
     brace_spans = []
     stack = []
     start = None
@@ -57,7 +64,7 @@ def extract_json(text: str) -> Optional[str]:
                 start = None
     for s, e in brace_spans:
         candidates.append(text[s:e])
-    # find [...] spans
+    # [...] spans
     arr_spans = []
     stack = []
     start = None
@@ -73,14 +80,14 @@ def extract_json(text: str) -> Optional[str]:
                 start = None
     for s, e in arr_spans:
         candidates.append(text[s:e])
-
+    # try to parse candidates
     for c in candidates:
         try:
             json.loads(c)
             return c
         except Exception:
             continue
-    # as a last resort, try to parse the whole thing
+    # try whole text as last resort
     try:
         json.loads(text)
         return text
@@ -88,11 +95,11 @@ def extract_json(text: str) -> Optional[str]:
         return None
 
 # -----------------------
-# Fallback generator
+# Built-in fallback generator/grader
 # -----------------------
 def simple_fallback_quiz(context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> List[QuizQuestion]:
     """
-    A very simple internal quiz generator (no external calls). Produces basic MC or open questions.
+    Simple internal quiz generator producing basic MC or open questions.
     """
     source = (context_text or subject or "General knowledge").strip()
     sentences = re.split(r'(?<=[.!?])\s+', source)
@@ -117,6 +124,17 @@ def simple_fallback_quiz(context_text: str, subject: str, difficulty: str, n_que
             explanation = f"A good answer should refer to: {sent}"
             questions.append(QuizQuestion(id=i+1, type="open", prompt=q_prompt, choices=None, answer=sent, explanation=explanation))
     return questions
+
+def simple_fallback_grade(reference: str, student_answer: str) -> Dict[str, Any]:
+    ref_words = set(re.findall(r"\w+", reference.lower()))
+    stud_words = set(re.findall(r"\w+", student_answer.lower()))
+    common = ref_words & stud_words
+    if not ref_words:
+        score = 0
+    else:
+        score = int(100 * len(common) / len(ref_words))
+    feedback = f"Fallback grading: {len(common)} overlapping key words. Expected key points: {reference}"
+    return {"score": score, "feedback": feedback}
 
 # -----------------------
 # Prompt builders
@@ -156,21 +174,15 @@ Difficulty: {difficulty}
 Return ONLY valid JSON like: {{ "score": <int 0-100>, "feedback": "<detailed feedback explaining strengths, weaknesses, and how to improve>" }}"""
 
 # -----------------------
-# Google Generative API calls
+# Google Generative API interaction (fixed model)
 # -----------------------
 def call_google_generate(model: str, api_key: str, prompt_text: str, max_output_tokens: int = 1024, temperature: float = 0.2, timeout: int = 60) -> Optional[str]:
     """
-    Call Google Generative Language API (REST) to generate text.
-    model e.g. "models/text-bison-001"
-    api_key: your Google API key (kept secret in the sidebar)
-    Returns generated text or None on failure.
+    Call Google Generative Language API (REST) to generate text using a fixed model.
+    model: "text-bison-001" (the function will prefix with models/ if needed)
     """
     if not api_key:
         return None
-    # Endpoint pattern: https://generativelanguage.googleapis.com/v1beta2/{model}:generateText?key=API_KEY
-    # Accept model param as either "text-bison-001" or "models/text-bison-001"
-    if not model:
-        model = "text-bison-001"
     if not model.startswith("models/"):
         model_path = f"models/{model}"
     else:
@@ -186,28 +198,26 @@ def call_google_generate(model: str, api_key: str, prompt_text: str, max_output_
         resp = requests.post(url, headers=headers, json=body, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
-        # expected: data["candidates"][0]["content"]
         if isinstance(data, dict) and "candidates" in data and isinstance(data["candidates"], list) and len(data["candidates"]) > 0:
             content = data["candidates"][0].get("content")
             if content is None:
-                # sometimes "output" or "content"? try keys
+                # try alternative keys
                 for k in ("output", "content", "text"):
                     if k in data["candidates"][0]:
                         return data["candidates"][0].get(k)
             return content
-        # fallback try stringifying
         return json.dumps(data)
     except Exception:
         return None
 
-def generate_quiz_with_google(model: str, api_key: str, context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> Optional[List[QuizQuestion]]:
+def generate_quiz_with_google(api_key: str, context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> Optional[List[QuizQuestion]]:
     """
-    Generate quiz using Google Generative API.
+    Generate quiz using Google Generative API with a fixed model.
     """
     if not api_key:
         return None
     prompt = build_generation_prompt(context_text, subject, difficulty, n_questions, q_type)
-    text = call_google_generate(model, api_key, prompt, max_output_tokens=1024, temperature=0.2)
+    text = call_google_generate(GOOGLE_MODEL, api_key, prompt, max_output_tokens=1024, temperature=0.2)
     if not text:
         return None
     json_str = extract_json(text) or text
@@ -228,27 +238,17 @@ def generate_quiz_with_google(model: str, api_key: str, context_text: str, subje
     except Exception:
         return None
 
-def grade_open_answer_with_google(model: str, api_key: str, question: str, reference: str, student_answer: str, difficulty: str) -> Dict[str, Any]:
+def grade_open_answer_with_google(api_key: str, question: str, reference: str, student_answer: str, difficulty: str) -> Dict[str, Any]:
     """
-    Use Google model to grade an open answer. Returns a dict {"score": int, "feedback": str}.
+    Use Google model (fixed) to grade an open answer. Returns a dict {"score": int, "feedback": str}.
     Falls back to simple overlap scoring on failure.
     """
     if not api_key:
-        # fallback to naive scoring
-        ref_words = set(re.findall(r"\w+", reference.lower()))
-        stud_words = set(re.findall(r"\w+", student_answer.lower()))
-        common = ref_words & stud_words
-        if not ref_words:
-            score = 0
-        else:
-            score = int(100 * len(common) / len(ref_words))
-        feedback = f"Fallback grading: {len(common)} overlapping key words. Expected key points: {reference}"
-        return {"score": score, "feedback": feedback}
+        return simple_fallback_grade(reference, student_answer)
     prompt = build_grading_prompt(question, reference, student_answer, difficulty)
-    text = call_google_generate(model, api_key, prompt, max_output_tokens=400, temperature=0.0)
+    text = call_google_generate(GOOGLE_MODEL, api_key, prompt, max_output_tokens=400, temperature=0.0)
     if not text:
-        # fallback
-        return {"score": 0, "feedback": "Grading failed (no response)."}
+        return {"score": 0, "feedback": "Grading failed (no response from Google)."}
     json_str = extract_json(text) or text
     try:
         parsed = json.loads(json_str)
@@ -256,19 +256,13 @@ def grade_open_answer_with_google(model: str, api_key: str, question: str, refer
         feedback = parsed.get("feedback", "")
         return {"score": score, "feedback": feedback}
     except Exception:
-        # fallback naive
-        ref_words = set(re.findall(r"\w+", reference.lower()))
-        stud_words = set(re.findall(r"\w+", student_answer.lower()))
-        common = ref_words & stud_words
-        score = int(100 * len(common) / len(ref_words)) if ref_words else 0
-        feedback = f"Fallback grading (post-parse): {len(common)} overlapping key words. Expected key points: {reference}"
-        return {"score": score, "feedback": feedback}
+        return simple_fallback_grade(reference, student_answer)
 
 # -----------------------
-# Streamlit UI
+# Streamlit UI (no API key input in UI)
 # -----------------------
-st.set_page_config(page_title="Google Generative Quiz Generator", layout="wide")
-st.title("Quiz Generator — Google Generative API (optional) + Built-in Fallback")
+st.set_page_config(page_title="Quiz Generator (Google fixed model)", layout="wide")
+st.title("Quiz Generator — fixed Google model (text-bison-001) — API key not requested in UI")
 
 st.sidebar.header("Quiz Source")
 source_choice = st.sidebar.radio("Create quiz from:", ("Upload text file", "Subject / short description"))
@@ -298,14 +292,17 @@ n_questions = st.sidebar.slider("Number of questions", 1, 20, 5)
 q_type = st.sidebar.selectbox("Question type", ["multiple_choice", "open", "mix"])
 randomize = st.sidebar.checkbox("Randomize question order", value=True)
 
-st.sidebar.header("Google Generative API (optional)")
-st.sidebar.write("Provide your Google API key to enable the Generative API (text-bison-001 or other model). If left blank the app will use the fully self-contained fallback generator.")
-google_api_key = st.sidebar.text_input("Google API Key (optional)", type="password")
-google_model = st.sidebar.text_input("Google model (e.g. text-bison-001)", value="text-bison-001")
-st.sidebar.markdown("Google Generative API docs: https://developers.generativeai.google/")
-
 st.sidebar.markdown("---")
-st.sidebar.markdown("Privacy: your API key is used only by this running app. Do not paste keys you don't trust. If you don't provide a key, the app uses the internal fallback generator.")
+st.sidebar.markdown("This app will use Google Generative API with model 'text-bison-001' if a key is configured in st.secrets or the GOOGLE_API_KEY environment variable. The key is NOT requested or shown in the UI.")
+
+# retrieve API key securely (st.secrets -> env)
+google_api_key = None
+try:
+    google_api_key = st.secrets.get("GOOGLE_API_KEY") if hasattr(st, "secrets") else None
+except Exception:
+    google_api_key = None
+if not google_api_key:
+    google_api_key = os.environ.get("GOOGLE_API_KEY")
 
 # Generate quiz button
 generate_button = st.sidebar.button("Generate Quiz")
@@ -328,9 +325,9 @@ if generate_button:
     else:
         with st.spinner("Generating quiz..."):
             qs: Optional[List[QuizQuestion]] = None
-            # Try Google if API key provided
+            # Try Google if API key present
             if google_api_key:
-                qs = generate_quiz_with_google(google_model, google_api_key, context_text, subject, difficulty, n_questions, q_type)
+                qs = generate_quiz_with_google(google_api_key, context_text, subject, difficulty, n_questions, q_type)
                 if qs is None:
                     st.warning("Google generation failed or returned invalid output. Falling back to internal generator.")
             if qs is None:
@@ -392,9 +389,9 @@ if quiz:
                 else:
                     max_score += 100
                     if google_api_key:
-                        grade = grade_open_answer_with_google(google_model, google_api_key, q.prompt, q.answer, user_ans, difficulty)
+                        grade = grade_open_answer_with_google(google_api_key, q.prompt, q.answer, user_ans, difficulty)
                     else:
-                        grade = grade_open_answer_with_google("", "", q.prompt, q.answer, user_ans, difficulty)
+                        grade = simple_fallback_grade(q.answer, user_ans)
                     score = int(grade.get("score", 0))
                     total_score += score
                     fb = {
@@ -435,4 +432,4 @@ if fb:
     st.button("Regenerate quiz or try again", on_click=lambda: st.session_state.update({"quiz": None, "answers": {}, "feedback": None}))
 
 st.markdown("----")
-st.write("Tips: For best results, paste a Google Generative API key in the sidebar and keep your model as 'text-bison-001' (or another available Generative model). If no key is provided, the app uses a simple built-in generator.")
+st.write("Notes: The app will use a configured Google API key (st.secrets['GOOGLE_API_KEY'] or env var GOOGLE_API_KEY) and the fixed model 'text-bison-001' for richer generation and grading. If no key is configured, the app will use the built-in fallback generator and grader.")

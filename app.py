@@ -1,5 +1,6 @@
 # AI Quiz Generator — Streamlit Webapp (FREE, NO API KEYS)
 # Save this file as app.py and run with: streamlit run app.py
+# Updated to generate multiple (default 10) questions and to improve open-question prompts + post-processing.
 
 import streamlit as st
 from transformers import pipeline
@@ -7,6 +8,7 @@ from sentence_transformers import SentenceTransformer, util
 import spacy
 import sys
 import traceback
+import re
 
 # -----------------------------------------------------------
 # LOAD MODELS (FREE OPEN SOURCE)
@@ -113,7 +115,7 @@ def generate_text(prompt, max_new_tokens=200):
 
 
 def fallback_generator(prompt, max_new_tokens):
-    amount = 4
+    amount = 10
     for token in prompt.split():
         if token.isdigit():
             try:
@@ -142,8 +144,7 @@ def fallback_generator(prompt, max_new_tokens):
 # -----------------------------------------------------------
 # PROMPTS — explicit, with example and strict output instruction
 # -----------------------------------------------------------
-def make_mc_questions(text, amount=4):
-    # Few-shot example + clear "output only" instruction
+def make_mc_questions(text, amount=10):
     example = (
         "Voorbeeld:\n"
         "Tekst: Nederland heeft een monetaire unie en belangrijke export.\n"
@@ -155,56 +156,93 @@ def make_mc_questions(text, amount=4):
     prompt = (
         "Opdracht: Maak multiple choice-vragen.\n"
         "Output: Geef alleen de vragen en opties. Herhaal of kopieer de instructie NIET.\n"
-        f"Format: Nummer. Vraag\\nA) ...\\nB) ...\\nC) ...\\nD) ...\\n\n"
+        "Format: Nummer. Vraag\\nA) ...\\nB) ...\\nC) ...\\nD) ...\\n\n"
         f"{example}"
         f"Invoer: Maak {amount} meerkeuzevragen over deze tekst of dit onderwerp. "
         "Voor elke vraag: 1 juist antwoord en 3 foute antwoorden. Gebruik duidelijke nummering.\n\n"
         f"Tekst:\n{text}\n\nAntwoord:"
     )
-    out = generate_text(prompt, max_new_tokens=300)
-    # If model echoes instructions, try to strip up to the first '1.'
-    cleaned = post_process_output(out)
+    # Increase token limit to allow many MC questions
+    out = generate_text(prompt, max_new_tokens=600)
+    cleaned = post_process_output(out, amount)
     return cleaned
 
 
-def make_open_questions(text, amount=4):
+def make_open_questions(text, amount=10):
+    # Few-shot example showing multiple numbered open questions
     example = (
         "Voorbeeld:\n"
         "Tekst: De industriële revolutie bracht grote technologische veranderingen.\n"
         "Antwoord:\n"
         "1. Noem een technische innovatie uit de industriële revolutie.\n"
-        "2. Leg kort uit waarom urbanisatie toen toenam.\n\n"
+        "2. Leg kort uit waarom urbanisatie toen toenam.\n"
+        "3. Welke sectoren profiteerden het meest van mechanisatie?\n\n"
     )
 
     prompt = (
         "Opdracht: Maak open vragen.\n"
-        "Output: Geef alleen de lijst met vragen genummerd. Herhaal of kopieer de instructie NIET.\n"
-        f"Format: Nummer. Vraag\\n\n"
+        "Output: Geef alleen de genummerde lijst met vragen. Herhaal of kopieer de instructie NIET.\n"
+        "Format: Nummer. Vraag\\n\n"
         f"{example}"
         f"Invoer: Maak {amount} open toetsvragen gebaseerd op deze tekst of dit onderwerp. "
         "Geef GEEN antwoorden, alleen de vragen. Gebruik duidelijke nummering.\n\n"
         f"Tekst:\n{text}\n\nAntwoord:"
     )
-    out = generate_text(prompt, max_new_tokens=200)
-    cleaned = post_process_output(out)
+    # Increase token limit for 10 open questions
+    out = generate_text(prompt, max_new_tokens=400)
+    cleaned = post_process_output(out, amount)
     return cleaned
 
 
-def post_process_output(out):
+def post_process_output(out, expected_amount=10):
     """
     Try to remove instruction echoing and return only the numbered questions block.
     We search for the first numbered item like '1.' and return from there.
+    Also try to ensure we return up to expected_amount numbered items.
     """
     if not out:
         return out
-    # find first occurrence of a numbered question like '1.' or '1)'
-    import re
+
+    # Normalize some common artifacts
+    out = out.replace("\r\n", "\n").strip()
+
+    # find the first occurrence of a numbered question like '1.' or '1)'
     m = re.search(r'(^|\n)\s*1[.)]\s*', out)
-    if m:
-        return out[m.start():].strip()
-    # fallback: return the whole output but strip common instruction lines
-    lines = [l for l in out.splitlines() if not l.strip().lower().startswith("opdracht")]
-    return "\n".join(lines).strip()
+    start_idx = m.start() if m else 0
+    candidate = out[start_idx:].strip()
+
+    # Split into lines and collect lines until we've seen expected_amount question numbers
+    lines = candidate.splitlines()
+    collected = []
+    qcount = 0
+    current_block = []
+    for line in lines:
+        if re.match(r'^\s*\d+[.)]\s+', line):
+            # new question starts
+            if current_block:
+                collected.append("\n".join(current_block).strip())
+            current_block = [line.strip()]
+            qcount += 1
+        else:
+            # continuation line (e.g., options or multi-line question)
+            if current_block:
+                current_block.append(line.rstrip())
+        if qcount >= expected_amount:
+            # after capturing expected_amount questions, continue collecting their option lines (if any),
+            # but stop once we've likely passed them (heuristic: break if we hit a blank line after options)
+            # we'll continue to finish the current_block then break
+            pass
+    if current_block:
+        collected.append("\n".join(current_block).strip())
+
+    # If we found numbered questions, join the first expected_amount of them
+    if collected and len(collected) >= 1:
+        selected = collected[:expected_amount]
+        # If the model included options (e.g., A/B/C/D) they are preserved; otherwise it's plain questions.
+        return "\n\n".join(selected).strip()
+
+    # fallback: try to extract lines starting with A)/A) pattern (for MC), or just return whole cleaned string
+    return candidate
 
 
 # -----------------------------------------------------------
@@ -242,6 +280,9 @@ mode = st.radio(
     ["Quiz uit lesmateriaal", "Quiz over een onderwerp (zonder tekst)"]
 )
 
+# Let the user choose how many questions to generate (default 10)
+amount = st.slider("Aantal vragen", min_value=1, max_value=20, value=10, step=1)
+
 # MODE A — TEXT INPUT
 if mode == "Quiz uit lesmateriaal":
     text = st.text_area("Plak je lesmateriaal hieronder:")
@@ -252,11 +293,11 @@ if mode == "Quiz uit lesmateriaal":
         else:
             st.subheader("Meerkeuzevragen")
             with st.spinner("Genereer meerkeuzevragen..."):
-                st.write(make_mc_questions(text))
+                st.write(make_mc_questions(text, amount=amount))
 
             st.subheader("Open vragen")
             with st.spinner("Genereer open vragen..."):
-                st.write(make_open_questions(text))
+                st.write(make_open_questions(text, amount=amount))
 
 
 # MODE B — QUIZ WITHOUT TEXT
@@ -269,11 +310,11 @@ if mode == "Quiz over een onderwerp (zonder tekst)":
         else:
             st.subheader(f"Quiz over: {topic}")
             with st.spinner("Genereer meerkeuzevragen..."):
-                st.write(make_mc_questions(topic))
+                st.write(make_mc_questions(topic, amount=amount))
 
             st.subheader("Open vragen")
             with st.spinner("Genereer open vragen..."):
-                st.write(make_open_questions(topic))
+                st.write(make_open_questions(topic, amount=amount))
 
 
 # FEEDBACK SECTION

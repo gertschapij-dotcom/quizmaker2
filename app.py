@@ -1,7 +1,5 @@
 # AI Quiz Generator — Streamlit Webapp (FREE, NO API KEYS)
 # Save this file as app.py and run with: streamlit run app.py
-# This version prefers instruction-tuned models (Flan-T5) and uses clearer prompts
-# to avoid the model echoing the instructions or producing gibberish.
 
 import streamlit as st
 from transformers import pipeline
@@ -11,7 +9,7 @@ import sys
 import traceback
 
 # -----------------------------------------------------------
-# LOAD MODELS (FREE OPEN SOURCE) — robust/fallback behavior
+# LOAD MODELS (FREE OPEN SOURCE)
 # -----------------------------------------------------------
 @st.cache_resource
 def load_models():
@@ -36,14 +34,12 @@ def load_models():
     model_candidates = [
         ("google/flan-t5-small", "text2text-generation"),
         ("google/flan-t5-base", "text2text-generation"),
-        # fallback to autoregressive models if T5 not available
         ("distilgpt2", "text-generation"),
         ("gpt2", "text-generation"),
     ]
 
     for model_name, task in model_candidates:
         try:
-            # create pipeline for the task
             text_pipeline = pipeline(task, model=model_name)
             text_pipeline_task = task
             text_model = model_name
@@ -68,41 +64,46 @@ def load_models():
     return nlp, text_pipeline, feedback_model, text_pipeline_task
 
 
-# Unpack loaded models (quiz_model may be None if none could be loaded)
 nlp, quiz_model, feedback_model, quiz_model_task = load_models()
 
 
 # -----------------------------------------------------------
-# GENERATION HELPERS
+# GENERATION HELPERS (deterministic for instruction models)
 # -----------------------------------------------------------
 def generate_text(prompt, max_new_tokens=200):
-    """
-    Use the loaded pipeline to generate text. If no pipeline is available,
-    fall back to a simple deterministic generator so the app still shows output.
-    """
     if quiz_model is not None:
         try:
-            # Use conservative generation settings to reduce repetition/gibberish.
-            gen_kwargs = {
-                "max_new_tokens": max_new_tokens,
-                "do_sample": True,
-                "temperature": 0.25,  # low temp -> less random nonsense
-                "top_p": 0.9,
-            }
+            # If the pipeline is a text2text/instruction model (T5/Flan), prefer deterministic beams
+            if quiz_model_task == "text2text-generation":
+                gen_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": False,
+                    "num_beams": 4,
+                    "early_stopping": True,
+                    "no_repeat_ngram_size": 3,
+                }
+            else:
+                # Autoregressive fallback: low temperature sampling to reduce gibberish
+                gen_kwargs = {
+                    "max_new_tokens": max_new_tokens,
+                    "do_sample": True,
+                    "temperature": 0.25,
+                    "top_p": 0.9,
+                    "no_repeat_ngram_size": 3,
+                }
+
             out = quiz_model(prompt, **gen_kwargs)
-            # pipeline returns a list of dicts with 'generated_text'
+
             if isinstance(out, list) and len(out) > 0:
                 first = out[0]
-                # Some pipelines (different versions) may return 'generated_text' or 'text'
                 if "generated_text" in first:
                     return first["generated_text"].strip()
                 elif "text" in first:
                     return first["text"].strip()
                 else:
-                    return str(first)
+                    return str(first).strip()
             return str(out).strip()
         except Exception:
-            # Show the traceback in the Streamlit UI so you can debug in logs
             traceback_str = traceback.format_exc()
             st.error("Text-generation model crashed while generating text. See trace below.")
             st.text_area("Model error trace", traceback_str, height=200)
@@ -112,11 +113,6 @@ def generate_text(prompt, max_new_tokens=200):
 
 
 def fallback_generator(prompt, max_new_tokens):
-    """
-    Very simple deterministic fallback so the UI still shows plausible output
-    when no model is available.
-    """
-    # try to find amount in prompt (simple heuristic)
     amount = 4
     for token in prompt.split():
         if token.isdigit():
@@ -134,7 +130,7 @@ def fallback_generator(prompt, max_new_tokens):
             out_lines.append("B) Fout antwoord 1")
             out_lines.append("C) Fout antwoord 2")
             out_lines.append("D) Fout antwoord 3")
-            out_lines.append("")  # blank line
+            out_lines.append("")
         return "\n".join(out_lines)
     else:
         out_lines = []
@@ -144,29 +140,71 @@ def fallback_generator(prompt, max_new_tokens):
 
 
 # -----------------------------------------------------------
-# QUESTION GENERATION FUNCTIONS
+# PROMPTS — explicit, with example and strict output instruction
 # -----------------------------------------------------------
 def make_mc_questions(text, amount=4):
-    # Use a clear instruction-style prompt that T5 and other instruction models follow well.
+    # Few-shot example + clear "output only" instruction
+    example = (
+        "Voorbeeld:\n"
+        "Tekst: Nederland heeft een monetaire unie en belangrijke export.\n"
+        "Antwoord:\n"
+        "1. Welke stad is de hoofdstad van Nederland?\n"
+        "A) Amsterdam\nB) Rotterdam\nC) Den Haag\nD) Utrecht\n\n"
+    )
+
     prompt = (
         "Opdracht: Maak multiple choice-vragen.\n"
+        "Output: Geef alleen de vragen en opties. Herhaal of kopieer de instructie NIET.\n"
+        f"Format: Nummer. Vraag\\nA) ...\\nB) ...\\nC) ...\\nD) ...\\n\n"
+        f"{example}"
         f"Invoer: Maak {amount} meerkeuzevragen over deze tekst of dit onderwerp. "
-        "Voor elke vraag: 1 juist antwoord en 3 foute antwoorden. Gebruik duidelijke nummering.\n"
+        "Voor elke vraag: 1 juist antwoord en 3 foute antwoorden. Gebruik duidelijke nummering.\n\n"
         f"Tekst:\n{text}\n\nAntwoord:"
     )
     out = generate_text(prompt, max_new_tokens=300)
-    return out.strip()
+    # If model echoes instructions, try to strip up to the first '1.'
+    cleaned = post_process_output(out)
+    return cleaned
 
 
 def make_open_questions(text, amount=4):
+    example = (
+        "Voorbeeld:\n"
+        "Tekst: De industriële revolutie bracht grote technologische veranderingen.\n"
+        "Antwoord:\n"
+        "1. Noem een technische innovatie uit de industriële revolutie.\n"
+        "2. Leg kort uit waarom urbanisatie toen toenam.\n\n"
+    )
+
     prompt = (
         "Opdracht: Maak open vragen.\n"
+        "Output: Geef alleen de lijst met vragen genummerd. Herhaal of kopieer de instructie NIET.\n"
+        f"Format: Nummer. Vraag\\n\n"
+        f"{example}"
         f"Invoer: Maak {amount} open toetsvragen gebaseerd op deze tekst of dit onderwerp. "
-        "Geef GEEN antwoorden, alleen de vragen. Gebruik duidelijke nummering.\n"
+        "Geef GEEN antwoorden, alleen de vragen. Gebruik duidelijke nummering.\n\n"
         f"Tekst:\n{text}\n\nAntwoord:"
     )
     out = generate_text(prompt, max_new_tokens=200)
-    return out.strip()
+    cleaned = post_process_output(out)
+    return cleaned
+
+
+def post_process_output(out):
+    """
+    Try to remove instruction echoing and return only the numbered questions block.
+    We search for the first numbered item like '1.' and return from there.
+    """
+    if not out:
+        return out
+    # find first occurrence of a numbered question like '1.' or '1)'
+    import re
+    m = re.search(r'(^|\n)\s*1[.)]\s*', out)
+    if m:
+        return out[m.start():].strip()
+    # fallback: return the whole output but strip common instruction lines
+    lines = [l for l in out.splitlines() if not l.strip().lower().startswith("opdracht")]
+    return "\n".join(lines).strip()
 
 
 # -----------------------------------------------------------

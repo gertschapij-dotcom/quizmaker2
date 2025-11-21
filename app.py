@@ -1,399 +1,431 @@
-# AI-free Quiz Generator — Streamlit Webapp (Dutch)
-# This file is a corrected version (fixes a syntax error in the multiple-choice fallback generator).
-# Save as app.py and run with: streamlit run app.py
-#
-# Notes:
-# - Uses spaCy if available to extract entities and sentences.
-# - Generates multiple-choice and open questions without requiring large LLMs.
+"""
+Streamlit Quiz App using a free self-contained local LLM (GPT4All recommended)
+
+How it works (high level):
+- Accepts either an uploaded context text file OR a short subject line.
+- Lets user choose difficulty, number of questions, and question type (multiple choice, open answer, mix).
+- Uses a local LLM (gpt4all via the gpt4all Python package) to generate a quiz in structured JSON.
+- Presents the quiz, collects user answers, and then provides detailed feedback:
+  - For multiple-choice: immediate correctness and explanation from the generated key.
+  - For open-ended: uses the LLM to grade / score the open answer and produce detailed feedback.
+- Includes a small built-in fallback generator if the local model isn't available.
+
+Notes:
+- To use a local LLM, install the 'gpt4all' Python package and download a compatible model (see README).
+- The app attempts to be robust to model output; it will try to parse JSON out of the LLM response.
+"""
 
 import streamlit as st
-import random
+import json
 import re
-from typing import List, Tuple
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+import random
 
-# Try to import spacy and sentence-transformers (optional)
+# Try to import gpt4all; if not available we'll use fallback
 try:
-    import spacy
-    from spacy.lang.nl import Dutch  # not strictly required but kept for clarity
-    SPACY_AVAILABLE = True
+    from gpt4all import GPT4All
+    GPT4ALL_AVAILABLE = True
 except Exception:
-    SPACY_AVAILABLE = False
+    GPT4ALL_AVAILABLE = False
 
-try:
-    from sentence_transformers import SentenceTransformer, util
-    ST_AVAILABLE = True
-except Exception:
-    ST_AVAILABLE = False
+# -----------------------
+# Data structures
+# -----------------------
+@dataclass
+class QuizQuestion:
+    id: int
+    type: str  # "multiple_choice" or "open"
+    prompt: str
+    choices: Optional[List[str]]  # only for multiple choice
+    answer: str  # canonical/expected answer (for MC this is the correct choice text or index)
+    explanation: str  # detailed explanation / answer key
 
-# --- Utility data for distractors ---
-COMMON_PERSONS = [
-    "Jan", "Piet", "Karel", "Sofie", "Anna", "Maria", "Willem", "Kees", "Jeroen", "Lisa"
-]
-COMMON_ORGS = [
-    "De Nederlandse Bank", "Ministerie van Financiën", "EU", "IMF", "World Bank",
-    "Bundesbank", "BMW", "Deutsche Bank"
-]
-COMMON_GPE = [
-    "Nederland", "Duitsland", "België", "Frankrijk", "Berlijn", "München", "Hamburg", "Brussel"
-]
-COMMON_TOPICS = [
-    "economie", "geschiedenis", "biologie", "programmeren", "wiskunde", "aardrijkskunde"
-]
+# -----------------------
+# Utility functions
+# -----------------------
+def extract_json(text: str) -> Optional[str]:
+    """
+    Attempt to extract a JSON object/array from text.
+    Returns the JSON substring if found, else None.
+    """
+    # Try to find the first {...} or [...] block that parses
+    # We'll search for top-level braces and attempt loads
+    candidates = []
+    # find all {...} spans
+    brace_spans = []
+    stack = []
+    start = None
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if start is None:
+                start = i
+            stack.append(i)
+        elif ch == '}' and stack:
+            stack.pop()
+            if not stack and start is not None:
+                brace_spans.append((start, i + 1))
+                start = None
+    for s, e in brace_spans:
+        candidates.append(text[s:e])
+    # also try arrays
+    arr_spans = []
+    stack = []
+    start = None
+    for i, ch in enumerate(text):
+        if ch == '[':
+            if start is None:
+                start = i
+            stack.append(i)
+        elif ch == ']' and stack:
+            stack.pop()
+            if not stack and start is not None:
+                arr_spans.append((start, i + 1))
+                start = None
+    for s, e in arr_spans:
+        candidates.append(text[s:e])
 
-# --- Load spaCy if available, try to download model if not loaded ---
-nlp = None
-if SPACY_AVAILABLE:
-    try:
-        nlp = spacy.load("en_core_web_sm")
-    except Exception:
-        # Try to download the model (best-effort)
+    for c in candidates:
         try:
-            import subprocess, sys
-            subprocess.check_call([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
-            nlp = spacy.load("en_core_web_sm")
+            json.loads(c)
+            return c
         except Exception:
-            nlp = None
-
-# --- Optional sentence-transformers model for semantic feedback ---
-st_model = None
-if ST_AVAILABLE:
-    try:
-        st_model = SentenceTransformer("all-MiniLM-L6-v2")
-    except Exception:
-        st_model = None
-
-# --- Core generation logic ---
-
-def sanitize_text(text: str) -> str:
-    return text.strip()
-
-def split_sentences(text: str) -> List[str]:
-    if nlp:
-        doc = nlp(text)
-        return [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-    # fallback: naive split on punctuation
-    parts = re.split(r'(?<=[.!?])\s+', text)
-    return [p.strip() for p in parts if p.strip()]
-
-def extract_entities(text: str) -> List[Tuple[str, str, str]]:
-    """
-    Return list of (ent_text, ent_label, sentence) from the text
-    Uses spaCy NER when available; otherwise heuristics (dates/numbers/caps)
-    """
-    entities = []
-    if nlp:
-        doc = nlp(text)
-        for sent in doc.sents:
-            for ent in sent.ents:
-                entities.append((ent.text, ent.label_, sent.text.strip()))
-    else:
-        # Very simple heuristic: look for capitalized phrases and years/dates
-        sents = split_sentences(text)
-        for s in sents:
-            caps = re.findall(r'\b[A-Z][a-z]{2,}(?:\s[A-Z][a-z]{2,})*', s)
-            for c in caps:
-                entities.append((c, "PROPN", s))
-            years = re.findall(r'\b(18|19|20)\d{2}\b', s)
-            for y in years:
-                entities.append((y, "DATE", s))
-    return entities
-
-def make_cloze_from_entity(ent_text: str, sentence: str) -> str:
-    """
-    Replace the first occurrence of ent_text in sentence with a blank
-    """
-    # escape regex chars in ent_text
-    pattern = re.escape(ent_text)
-    new = re.sub(pattern, "_____", sentence, count=1, flags=re.IGNORECASE)
-    # If replacement failed, append blank at end
-    if "_____" not in new:
-        return sentence + " _____"
-    return new
-
-def generate_distractors(correct: str, label: str, pool: List[str]) -> List[str]:
-    """
-    Generate up to 3 distractors based on label and pool of found entities.
-    Always returns 3 items (may include simple perturbations).
-    """
-    distractors = []
-    pool_candidates = [p for p in pool if p.lower() != correct.lower()]
-    random.shuffle(pool_candidates)
-
-    # Use pool entities first
-    for p in pool_candidates:
-        if len(distractors) >= 3:
-            break
-        if p.strip() and p.lower() != correct.lower():
-            distractors.append(p)
-
-    # If not enough, use label-based common lists or perturbations
-    if len(distractors) < 3:
-        if label in ("PERSON", "PER", "PROPN"):
-            src = COMMON_PERSONS
-            for v in src:
-                if v.lower() != correct.lower() and v not in distractors:
-                    distractors.append(v)
-                    if len(distractors) >= 3:
-                        break
-        elif label in ("ORG", "ORG_"):
-            for v in COMMON_ORGS:
-                if v.lower() != correct.lower() and v not in distractors:
-                    distractors.append(v)
-                    if len(distractors) >= 3:
-                        break
-        elif label in ("GPE", "LOC"):
-            for v in COMMON_GPE:
-                if v.lower() != correct.lower() and v not in distractors:
-                    distractors.append(v)
-                    if len(distractors) >= 3:
-                        break
-        elif label in ("DATE",):
-            # perturb years if possible
-            try:
-                y_match = re.search(r'\d{4}', correct)
-                if y_match:
-                    y = int(y_match.group())
-                    for delta in (1, -1, 5, -5, 10):
-                        candidate = str(y + delta)
-                        if candidate not in distractors and candidate != correct:
-                            distractors.append(candidate)
-                            if len(distractors) >= 3:
-                                break
-            except Exception:
-                pass
-
-    # Final fallback: generate simple variations
-    while len(distractors) < 3:
-        corrupted = corrupt_string(correct)
-        if corrupted not in distractors and corrupted.lower() != correct.lower():
-            distractors.append(corrupted)
-        else:
-            x = random.choice(COMMON_TOPICS)
-            if x not in distractors:
-                distractors.append(x)
-
-    return distractors[:3]
-
-def corrupt_string(s: str) -> str:
-    if not s:
-        return "Optie"
-    s = s.strip()
-    if len(s) > 3:
-        i = random.randint(0, len(s) - 2)
-        lst = list(s)
-        lst[i], lst[i+1] = lst[i+1], lst[i]
-        return "".join(lst)
-    return s + random.choice(["a", "en", "s"])
-
-# --- Public generation functions ---
-
-def generate_multiple_choice(text: str, amount: int = 10) -> str:
-    """
-    Generate 'amount' MC questions from text. Returns a formatted string.
-    Strategy:
-     - Extract entities and sentences
-     - For each entity create a cloze question and 3 distractors
-     - If not enough entities, create topical MC items from keywords/templates
-    """
-    text = sanitize_text(text)
-    sents = split_sentences(text)
-    entities = extract_entities(text)
-
-    # Build pool for distractors
-    pool = [e[0] for e in entities]
-
-    questions = []
-    used = set()
-
-    # Prioritize entities with longer text (more informative) and sentence length
-    entities_sorted = sorted(entities, key=lambda x: (-len(x[0]), -len(x[2])))
-
-    for ent_text, ent_label, sentence in entities_sorted:
-        if len(questions) >= amount:
-            break
-        key_lower = ent_text.lower()
-        if key_lower in used or len(ent_text.strip()) <= 1:
             continue
-        used.add(key_lower)
-        cloze = make_cloze_from_entity(ent_text, sentence)
-        correct = ent_text.strip()
-        distractors = generate_distractors(correct, ent_label, pool)
-        opts = [correct] + distractors
-        random.shuffle(opts)
-        opt_letters = ["A", "B", "C", "D"]
-        options_text = "\n".join([f"{opt_letters[i]}) {opts[i]}" for i in range(4)])
-        correct_letter = opt_letters[opts.index(correct)]
-        q_text = f"{len(questions)+1}. {cloze}\n{options_text}\nAntwoord: {correct_letter}) {correct}"
-        questions.append(q_text)
+    return None
 
-    # If not enough questions produced, generate template questions based on topic phrases
-    if len(questions) < amount:
-        # Generate based on keywords (nouns)
-        words = re.findall(r'\b[A-Za-zÀ-ÿ\-]{4,}\b', text)
-        keywords = []
-        for w in words:
-            if w.lower() not in COMMON_TOPICS and w.isalpha():
-                keywords.append(w)
-        keywords = list(dict.fromkeys(keywords))  # unique preserve order
-        i = 0
-        while len(questions) < amount:
-            keyword = keywords[i % max(1, len(keywords))] if keywords else random.choice(COMMON_TOPICS)
-            template_sentence = f"Welk van de volgende beweringen hoort bij {keyword}?"
-            correct = keyword
-            distractors = generate_distractors(correct, "PROPN", pool)
-            opts = [correct] + distractors
-            random.shuffle(opts)
-            opt_letters = ["A", "B", "C", "D"]
-            options_text = "\n".join([f"{opt_letters[j]}) {opts[j]}" for j in range(4)])
-            correct_letter = opt_letters[opts.index(correct)]
-            q_text = f"{len(questions)+1}. {template_sentence}\n{options_text}\nAntwoord: {correct_letter}) {correct}"
-            questions.append(q_text)
-            i += 1
-
-    return "\n\n".join(questions[:amount])
-
-def generate_open_questions(text: str, amount: int = 10) -> str:
+def simple_fallback_quiz(context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> List[QuizQuestion]:
     """
-    Generate 'amount' open questions:
-     - Prefer cloze-to-question conversions (replace named entity with 'Vul in' style)
-     - If topic-only (short input), use templates to produce many open questions
+    Very small heuristic quiz generator as fallback when no local LLM is available.
+    It will create straightforward factual or conceptual questions by extracting sentences.
     """
-    text = sanitize_text(text)
-    sents = split_sentences(text)
-    entities = extract_entities(text)
-
+    # Split text into sentences (naive)
+    sentences = re.split(r'(?<=[.!?])\s+', (context_text or subject).strip())
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
     questions = []
-    # 1) From sentences with entities, produce 'Vul in' or 'Leg uit' variants
-    for ent_text, ent_label, sentence in entities:
-        if len(questions) >= amount:
-            break
-        cloze = make_cloze_from_entity(ent_text, sentence)
-        if ent_label in ("PERSON", "ORG", "GPE", "PROPN"):
-            q = f"{len(questions)+1}. Vul in: {cloze}"
-        elif ent_label in ("DATE",):
-            q = f"{len(questions)+1}. Wanneer gebeurde het volgende: {cloze}"
+    for i in range(n_questions):
+        if i < len(sentences):
+            sent = sentences[i]
         else:
-            q = f"{len(questions)+1}. Leg uit: {sentence}"
-        questions.append(q)
-
-    # 2) If not enough, create template open questions from main sentences
-    i = 0
-    for sent in sents:
-        if len(questions) >= amount:
-            break
-        if len(sent.split()) < 5:
-            continue
-        templates = [
-            "{}. Vat de volgende zin samen in 1-2 zinnen: {}",
-            "{}. Noem twee belangrijke punten uit de volgende zin: {}",
-            "{}. Stel een toetsvraag over de volgende zin: {}",
-            "{}. Leg in het kort uit waarom dit belangrijk is: {}"
-        ]
-        tmpl = templates[i % len(templates)]
-        q = tmpl.format(len(questions)+1, sent)
-        questions.append(q)
-        i += 1
-
-    # 3) If still not enough (e.g., short input or topic-only), use topic templates
-    if len(questions) < amount:
-        base = text if len(text.split()) > 1 else text or "dit onderwerp"
-        topic_templates = [
-            "{}. Beschrijf in eigen woorden wat '{}' inhoudt.",
-            "{}. Noem drie mogelijke oorzaken van '{}'.",
-            "{}. Welke gevolgen kan '{}' hebben op korte termijn?",
-            "{}. Welke rol spelen belangrijke actoren in '{}'?"
-        ]
-        j = 0
-        while len(questions) < amount:
-            tmpl = topic_templates[j % len(topic_templates)]
-            q = tmpl.format(len(questions)+1, base)
-            questions.append(q)
-            j += 1
-
-    return "\n\n".join(questions[:amount])
-
-# --- Simple feedback checker (uses sentence-transformers if available) ---
-def check_answer(correct: str, user: str) -> str:
-    if st_model:
-        try:
-            emb1 = st_model.encode(correct, convert_to_tensor=True)
-            emb2 = st_model.encode(user, convert_to_tensor=True)
-            score = util.pytorch_cos_sim(emb1, emb2).item()
-            if score > 0.8:
-                return f"✅ Goed — similarity {score:.2f}"
-            elif score > 0.55:
-                return f"⚠️ Redelijk — similarity {score:.2f}"
+            sent = (subject or "This subject") + " overview."
+        q_prompt = f"Based on: {sent}\n\nWrite a short question asking about the key fact or idea in that sentence."
+        # naive transform: take a noun phrase or convert statement to question
+        # as fallback, reverse sentence to make a question
+        q_text = sent.rstrip('.')
+        q_text = "What is an important fact or idea in this statement: " + q_text + "?"
+        # multiple choice fallback: generate choices by perturbing final words
+        if q_type == "multiple_choice":
+            choices = []
+            words = re.findall(r"\w+", sent)
+            if words:
+                key = words[-1]
             else:
-                return f"❌ Niet correct — similarity {score:.2f}"
-        except Exception:
-            pass
-    corr = re.sub(r'\W+', ' ', correct.lower()).strip()
-    us = re.sub(r'\W+', ' ', user.lower()).strip()
-    if not corr or not us:
-        return "Vul beide velden in."
-    if corr in us or us in corr:
-        return "✅ Goed (string match)"
-    corr_set = set(corr.split())
-    us_set = set(us.split())
-    if not corr_set:
-        return "Geen referentietekst."
-    overlap = len(corr_set & us_set) / max(1, len(corr_set))
-    if overlap > 0.5:
-        return f"⚠️ Gedeeltelijk goed (overlap {overlap:.2f})"
-    return f"❌ Niet correct (overlap {overlap:.2f})"
-
-# --- Streamlit UI ---
-st.set_page_config(page_title="Quiz Generator (LLM-free)", layout="centered")
-st.title("Quiz Generator — LLM-free (SpaCy)")
-
-st.write("Genereer multiple-choice en open vragen gebaseerd op tekst of een onderwerp. "
-         "Deze versie werkt zonder grote LLMs en gebruikt spaCy voor analyse.")
-
-mode = st.radio("Kies modus:", ["Quiz uit lesmateriaal", "Quiz over een onderwerp (zonder tekst)"])
-
-amount = st.slider("Aantal vragen", min_value=1, max_value=20, value=10, step=1)
-
-if mode == "Quiz uit lesmateriaal":
-    text = st.text_area("Plak je lesmateriaal hier:", height=250)
-    if st.button("Genereer quiz"):
-        if not text.strip():
-            st.warning("Voer eerst lesmateriaal in.")
+                key = "concept"
+            choices = [key, key + "s", "another concept", "not related"]
+            random.shuffle(choices)
+            correct = choices[0]
+            explanation = f"The important term is '{key}' based on the sentence."
+            questions.append(QuizQuestion(id=i+1, type="multiple_choice", prompt=q_text, choices=choices, answer=correct, explanation=explanation))
         else:
-            with st.spinner("Genereer multiple-choice..."):
-                mc = generate_multiple_choice(text, amount=amount)
-                st.subheader("Meerkeuzevragen")
-                st.text_area("Meerkeuzevragen", value=mc, height=300)
-            with st.spinner("Genereer open vragen..."):
-                oq = generate_open_questions(text, amount=amount)
-                st.subheader("Open vragen")
-                st.text_area("Open vragen", value=oq, height=300)
+            explanation = f"An appropriate answer should mention the content of: {sent}"
+            questions.append(QuizQuestion(id=i+1, type="open", prompt=q_text, choices=None, answer=sent, explanation=explanation))
+    return questions
 
+# -----------------------
+# LLM interaction
+# -----------------------
+def build_generation_prompt(context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> str:
+    """
+    Build a clear prompt instructing the local model to output a JSON quiz.
+    We ask for a JSON array of questions; each question must contain:
+      - id (int)
+      - type: "multiple_choice" or "open"
+      - prompt (string)
+      - choices (array of strings)  # for multiple_choice
+      - answer (string)  # for MC: the correct choice text; for open: a short model answer/keypoints
+      - explanation (string): detailed feedback / expected answer explanation
+    We request only JSON in the output.
+    """
+    source = context_text if context_text else f"Subject: {subject}"
+    prompt = f"""
+You are a helpful quiz writer. Create a quiz of {n_questions} question(s) in JSON format ONLY.
+Context:
+\"\"\"{source}\"\"\"
+
+Difficulty: {difficulty}
+Question type preference: {q_type}
+
+Output MUST be valid JSON. Output a top-level object like: {{
+  "questions": [ ... ]
+}}
+
+Each question object must contain:
+- "id": integer
+- "type": either "multiple_choice" or "open"
+- "prompt": the question text
+- "choices": an array of strings (for multiple_choice only; for open type set to null or omit)
+- "answer": for multiple_choice: the exact text of the correct choice; for open: a short model answer or keypoint summary
+- "explanation": a detailed explanation and model answer to be shown after the user answers
+
+If q_type == "mix", then include a mix of types (roughly half MC and half open).
+Be concise but ensure clarity. Do not include any commentary outside the JSON.
+"""
+    return prompt
+
+def generate_quiz_with_gpt4all(model_name: str, context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str, timeout: int = 30) -> Optional[List[QuizQuestion]]:
+    """
+    Use GPT4All to generate a JSON quiz.
+    model_name: model alias or filename for GPT4All
+    Returns list of QuizQuestion or None on error.
+    """
+    if not GPT4ALL_AVAILABLE:
+        return None
+    try:
+        # initialize model
+        llm = GPT4All(model_name)
+        prompt = build_generation_prompt(context_text, subject, difficulty, n_questions, q_type)
+        # Show a short system prefacing to make the model deterministic-ish
+        # Use streaming disabled for simplicity
+        resp = llm.generate(prompt, max_tokens=1024, n_threads=4)
+        text = resp.strip()
+        json_str = extract_json(text) or text
+        parsed = json.loads(json_str)
+        qs = []
+        for q in parsed.get("questions", []):
+            qid = int(q.get("id", len(qs)+1))
+            qtype = q.get("type", "open")
+            prompt_text = q.get("prompt", "").strip()
+            choices = q.get("choices", None)
+            answer = q.get("answer", "")
+            explanation = q.get("explanation", "")
+            qs.append(QuizQuestion(id=qid, type=qtype, prompt=prompt_text, choices=choices, answer=answer, explanation=explanation))
+        # Enforce requested count
+        if len(qs) > n_questions:
+            qs = qs[:n_questions]
+        return qs
+    except Exception as e:
+        st.warning(f"LLM quiz generation failed: {e}")
+        return None
+
+def grade_open_answer_with_gpt4all(model_name: str, question: str, reference: str, student_answer: str, difficulty: str) -> Dict[str, Any]:
+    """
+    Use the local LLM to grade an open answer and return {score: int, feedback: str}
+    """
+    if not GPT4ALL_AVAILABLE:
+        # fallback naive grading: compare overlap of words
+        ref_words = set(re.findall(r"\w+", reference.lower()))
+        stud_words = set(re.findall(r"\w+", student_answer.lower()))
+        common = ref_words & stud_words
+        if not ref_words:
+            score = 0
+        else:
+            score = int(100 * len(common) / len(ref_words))
+        feedback = f"Fallback grading: {len(common)} overlapping key words. Expected key points: {reference}"
+        return {"score": score, "feedback": feedback}
+    try:
+        llm = GPT4All(model_name)
+        grade_prompt = f"""
+You are an objective grader. Grade the student's answer from 0 to 100 based on correctness and completeness relative to the reference answer.
+Question: {question}
+Reference / expected answer: {reference}
+Student answer: {student_answer}
+Difficulty: {difficulty}
+
+Return ONLY valid JSON like: {{"score": <int 0-100>, "feedback": "<detailed feedback explaining strengths, weaknesses, and how to improve>"}}
+"""
+        resp = llm.generate(grade_prompt, max_tokens=512, n_threads=4)
+        text = resp.strip()
+        json_str = extract_json(text) or text
+        parsed = json.loads(json_str)
+        return parsed
+    except Exception as e:
+        # fallback
+        return {"score": 0, "feedback": f"Grading failed: {e}"}
+
+# -----------------------
+# Streamlit UI
+# -----------------------
+st.set_page_config(page_title="Local LLM Quiz Generator", layout="wide")
+
+st.title("Local LLM Quiz Generator — Streamlit")
+
+st.sidebar.header("Quiz Source")
+source_choice = st.sidebar.radio("Create quiz from:", ("Upload text file", "Subject / short description"))
+uploaded_text = ""
+subject_line = ""
+if source_choice == "Upload text file":
+    uploaded_file = st.sidebar.file_uploader("Upload a large text file (txt, md, pdf copy-paste). For PDFs, copy content into a .txt.", type=["txt", "md"])
+    if uploaded_file is not None:
+        try:
+            raw = uploaded_file.read()
+            if isinstance(raw, bytes):
+                try:
+                    uploaded_text = raw.decode("utf-8")
+                except Exception:
+                    uploaded_text = raw.decode("latin-1")
+            else:
+                uploaded_text = str(raw)
+            st.sidebar.success("File loaded.")
+        except Exception as e:
+            st.sidebar.error(f"Could not read file: {e}")
 else:
-    topic = st.text_input("Voer een onderwerp in (bijv. Biologie, WO2, Python):")
-    if st.button("Genereer quiz over onderwerp"):
-        if not topic.strip():
-            st.warning("Voer een onderwerp in.")
+    subject_line = st.sidebar.text_input("Subject or short description", value="Photosynthesis and how plants convert light into energy")
+
+st.sidebar.header("Quiz Settings")
+difficulty = st.sidebar.selectbox("Difficulty", ["easy", "medium", "hard"])
+n_questions = st.sidebar.slider("Number of questions", 1, 20, 5)
+q_type = st.sidebar.selectbox("Question type", ["multiple_choice", "open", "mix"])
+randomize = st.sidebar.checkbox("Randomize question order", value=True)
+
+st.sidebar.header("Local Model (optional)")
+st.sidebar.write("If you have a local gpt4all / compatible model, specify its name or filename. If left blank the app will try to use a default gpt4all model if installed; otherwise it will use a simple fallback generator.")
+model_name = st.sidebar.text_input("GPT4All model alias or filename", value="gpt4all-lora-quantized.bin" if GPT4ALL_AVAILABLE else "")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("Notes:\n- To use a local model install the gpt4all package and download a compatible model (see README).")
+
+# Generate quiz
+generate_button = st.sidebar.button("Generate Quiz")
+
+# State to hold generated quiz
+if "quiz" not in st.session_state:
+    st.session_state["quiz"] = None
+if "answers" not in st.session_state:
+    st.session_state["answers"] = {}
+if "feedback" not in st.session_state:
+    st.session_state["feedback"] = None
+
+if generate_button:
+    st.session_state["answers"] = {}
+    st.session_state["feedback"] = None
+    context_text = uploaded_text.strip() if uploaded_text else ""
+    subject = subject_line.strip() if subject_line else ""
+    if not context_text and not subject:
+        st.sidebar.error("Please provide either an uploaded text file or a subject line.")
+    else:
+        with st.spinner("Generating quiz... This may take a little while if using a local LLM."):
+            qs = None
+            # Try LLM generation first if model present
+            if model_name and GPT4ALL_AVAILABLE:
+                qs = generate_quiz_with_gpt4all(model_name, context_text, subject, difficulty, n_questions, q_type)
+            elif GPT4ALL_AVAILABLE and not model_name:
+                # try default
+                qs = generate_quiz_with_gpt4all("gpt4all-lora-quantized.bin", context_text, subject, difficulty, n_questions, q_type)
+            if qs is None:
+                # fallback
+                st.info("Using fallback generator (no local model available or generation failed). The quiz will be simpler.")
+                qs = simple_fallback_quiz(context_text, subject, difficulty, n_questions, q_type if q_type!="mix" else "mixed")
+            if randomize:
+                random.shuffle(qs)
+            st.session_state["quiz"] = qs
+            st.success(f"Generated {len(qs)} question(s).")
+
+# Display quiz and collect answers
+quiz = st.session_state.get("quiz")
+if quiz:
+    st.header("Quiz")
+    form = st.form(key="quiz_form")
+    answers = {}
+    for q in quiz:
+        with st.expander(f"Question {q.id}: {q.type}", expanded=True):
+            st.write(q.prompt)
+            if q.type == "multiple_choice":
+                # ensure choices exist
+                choices = q.choices or ["A", "B", "C", "D"]
+                selected = form.radio(f"Select answer for Q{q.id}", choices, key=f"q_{q.id}")
+                answers[str(q.id)] = selected
+            else:
+                # open answer
+                txt = form.text_area(f"Your answer for Q{q.id}", key=f"q_{q.id}", height=120)
+                answers[str(q.id)] = txt
+    submit = form.form_submit_button("Submit Answers")
+    if submit:
+        st.session_state["answers"] = answers
+        # Grade
+        total_score = 0
+        max_score = 0
+        feedback_list = []
+        with st.spinner("Grading..."):
+            for q in quiz:
+                user_ans = answers.get(str(q.id), "")
+                if q.type == "multiple_choice":
+                    max_score += 1
+                    is_correct = False
+                    # compare strings normalized
+                    if isinstance(q.answer, str) and user_ans.strip().lower() == q.answer.strip().lower():
+                        is_correct = True
+                    # Some generated quizzes might store correct choice as an index like "B" or "1" - try to be forgiving
+                    # If choices list exists, try to map index
+                    if not is_correct and q.choices:
+                        # try index matching (1-based)
+                        try:
+                            idx = int(q.answer) - 1
+                            if 0 <= idx < len(q.choices) and q.choices[idx].strip().lower() == user_ans.strip().lower():
+                                is_correct = True
+                        except Exception:
+                            pass
+                    score = 1 if is_correct else 0
+                    total_score += score
+                    fb = {
+                        "id": q.id,
+                        "type": q.type,
+                        "question": q.prompt,
+                        "your_answer": user_ans,
+                        "correct_answer": q.answer,
+                        "is_correct": is_correct,
+                        "explanation": q.explanation
+                    }
+                    feedback_list.append(fb)
+                else:
+                    # open answer: grade with LLM or fallback
+                    max_score += 100
+                    if GPT4ALL_AVAILABLE and model_name:
+                        grade = grade_open_answer_with_gpt4all(model_name, q.prompt, q.answer, user_ans, difficulty)
+                    elif GPT4ALL_AVAILABLE:
+                        grade = grade_open_answer_with_gpt4all("gpt4all-lora-quantized.bin", q.prompt, q.answer, user_ans, difficulty)
+                    else:
+                        grade = grade_open_answer_with_gpt4all("", q.prompt, q.answer, user_ans, difficulty)
+                    # Normalize
+                    score = int(grade.get("score", 0))
+                    total_score += score
+                    fb = {
+                        "id": q.id,
+                        "type": q.type,
+                        "question": q.prompt,
+                        "your_answer": user_ans,
+                        "score": score,
+                        "feedback": grade.get("feedback", ""),
+                        "explanation": q.explanation
+                    }
+                    feedback_list.append(fb)
+        # compute percent for multiple-choice (where scale differs)
+        # For simplicity, compute an overall percent:
+        overall_percent = int(100 * total_score / max_score) if max_score > 0 else 0
+        st.session_state["feedback"] = {"overall_percent": overall_percent, "details": feedback_list}
+        st.success(f"Grading complete — Score: {overall_percent}%")
+
+# Show feedback
+fb = st.session_state.get("feedback")
+if fb:
+    st.header("Detailed Feedback")
+    st.write(f"Overall score: {fb['overall_percent']}%")
+    for item in fb["details"]:
+        st.markdown(f"### Question {item['id']}")
+        st.write(item["question"])
+        if item["type"] == "multiple_choice":
+            st.write(f"- Your answer: **{item['your_answer']}**")
+            correctness = "Correct ✅" if item.get("is_correct") else "Incorrect ❌"
+            st.write(f"- Result: **{correctness}**")
+            st.write(f"- Correct answer: **{item.get('correct_answer', '—')}**")
+            st.write(f"- Explanation: {item.get('explanation', '')}")
         else:
-            synthetic_text = (
-                f"{topic}. {topic} is een belangrijk onderwerp dat vaak wordt behandeld in lessen. "
-                f"Belangrijke aspecten van {topic} zijn beleid, geschiedenis, theorieën en voorbeelden."
-            )
-            with st.spinner("Genereer multiple-choice..."):
-                mc = generate_multiple_choice(synthetic_text, amount=amount)
-                st.subheader(f"Meerkeuzevragen — {topic}")
-                st.text_area("Meerkeuzevragen", value=mc, height=300)
-            with st.spinner("Genereer open vragen..."):
-                oq = generate_open_questions(topic, amount=amount)
-                st.subheader("Open vragen")
-                st.text_area("Open vragen", value=oq, height=300)
+            st.write(f"- Your answer (submitted):")
+            st.write(item.get("your_answer", ""))
+            st.write(f"- Score: **{item.get('score', 0)} / 100**")
+            st.write(f"- Feedback: {item.get('feedback', '')}")
+            st.write(f"- Reference explanation: {item.get('explanation', '')}")
+    st.markdown("---")
+    st.button("Regenerate quiz or try again", on_click=lambda: st.session_state.update({"quiz": None, "answers": {}, "feedback": None}))
 
-st.divider()
-st.header("📝 Antwoord Feedback Checker (Open Vragen)")
-correct = st.text_input("Modelantwoord (juiste antwoord):")
-user = st.text_input("Jouw antwoord:")
-if st.button("Geef feedback"):
-    res = check_answer(correct, user)
-    st.write(res)
-
-st.caption("Deze versie gebruikt heuristieken en spaCy om relevante vragen te genereren zonder een LLM. "
-           "Als je wilt, kan ik een versie maken die een klein instruction-tuned model gebruikt voor betere kwaliteit (vereist extra dependencies).")
+# Footer / tips
+st.markdown("----")
+st.write("Tips: For best results with detailed, accurate questions and grading, install a local model (e.g., GPT4All) and specify the model filename in the sidebar. If you don't have a model, the app will use a simple fallback generator and grading heuristic.")

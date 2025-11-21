@@ -1,20 +1,11 @@
-"""
-AI-free Quiz Generator — Streamlit Webapp (Dutch)
-This version is implemented from scratch with no heavy LLM requirements.
-It uses spaCy to analyze text and generates:
- - multiple-choice questions (MC) by creating cloze (fill-in) items from named entities
- - open questions using templates and sentence extraction
+# AI-free Quiz Generator — Streamlit Webapp (Dutch)
+# This file is a corrected version (fixes a syntax error in the multiple-choice fallback generator).
+# Save as app.py and run with: streamlit run app.py
+#
+# Notes:
+# - Uses spaCy if available to extract entities and sentences.
+# - Generates multiple-choice and open questions without requiring large LLMs.
 
-How to run:
- - Save as app.py
- - Ensure dependencies: pip install streamlit spacy
- - Download spaCy model: python -m spacy download en_core_web_sm
- - Run: streamlit run app.py
-
-Notes:
- - This approach avoids large transformers models so it runs reliably on Streamlit Cloud.
- - If sentence-transformers is installed, the app will use it for semantic feedback; otherwise a simple string-similarity fallback is used.
-"""
 import streamlit as st
 import random
 import re
@@ -23,7 +14,7 @@ from typing import List, Tuple
 # Try to import spacy and sentence-transformers (optional)
 try:
     import spacy
-    from spacy.lang.nl import Dutch
+    from spacy.lang.nl import Dutch  # not strictly required but kept for clarity
     SPACY_AVAILABLE = True
 except Exception:
     SPACY_AVAILABLE = False
@@ -132,7 +123,6 @@ def generate_distractors(correct: str, label: str, pool: List[str]) -> List[str]
     for p in pool_candidates:
         if len(distractors) >= 3:
             break
-        # simple sanity: avoid identical short tokens
         if p.strip() and p.lower() != correct.lower():
             distractors.append(p)
 
@@ -160,24 +150,24 @@ def generate_distractors(correct: str, label: str, pool: List[str]) -> List[str]
         elif label in ("DATE",):
             # perturb years if possible
             try:
-                y = int(re.search(r'\d{4}', correct).group())
-                for delta in (1, -1, 5, -5, 10):
-                    candidate = str(y + delta)
-                    if candidate not in distractors and candidate != correct:
-                        distractors.append(candidate)
-                        if len(distractors) >= 3:
-                            break
+                y_match = re.search(r'\d{4}', correct)
+                if y_match:
+                    y = int(y_match.group())
+                    for delta in (1, -1, 5, -5, 10):
+                        candidate = str(y + delta)
+                        if candidate not in distractors and candidate != correct:
+                            distractors.append(candidate)
+                            if len(distractors) >= 3:
+                                break
             except Exception:
                 pass
 
     # Final fallback: generate simple variations
     while len(distractors) < 3:
-        # add a mild corruption
         corrupted = corrupt_string(correct)
         if corrupted not in distractors and corrupted.lower() != correct.lower():
             distractors.append(corrupted)
         else:
-            # pick from common topics
             x = random.choice(COMMON_TOPICS)
             if x not in distractors:
                 distractors.append(x)
@@ -188,14 +178,12 @@ def corrupt_string(s: str) -> str:
     if not s:
         return "Optie"
     s = s.strip()
-    # swap two letters if possible
     if len(s) > 3:
         i = random.randint(0, len(s) - 2)
         lst = list(s)
         lst[i], lst[i+1] = lst[i+1], lst[i]
         return "".join(lst)
-    # else add suffix
-    return s + random.choice(["a", "en", "en", "s"])
+    return s + random.choice(["a", "en", "s"])
 
 # --- Public generation functions ---
 
@@ -230,12 +218,10 @@ def generate_multiple_choice(text: str, amount: int = 10) -> str:
         cloze = make_cloze_from_entity(ent_text, sentence)
         correct = ent_text.strip()
         distractors = generate_distractors(correct, ent_label, pool)
-        # shuffle options and keep track of answer
         opts = [correct] + distractors
         random.shuffle(opts)
         opt_letters = ["A", "B", "C", "D"]
         options_text = "\n".join([f"{opt_letters[i]}) {opts[i]}" for i in range(4)])
-        # find correct letter
         correct_letter = opt_letters[opts.index(correct)]
         q_text = f"{len(questions)+1}. {cloze}\n{options_text}\nAntwoord: {correct_letter}) {correct}"
         questions.append(q_text)
@@ -259,14 +245,12 @@ def generate_multiple_choice(text: str, amount: int = 10) -> str:
             random.shuffle(opts)
             opt_letters = ["A", "B", "C", "D"]
             options_text = "\n".join([f"{opt_letters[j]}) {opts[j]}" for j in range(4)])
-            q_text = f"{len(questions)+1}. {template_sentence}\n{options_text}\nAntwoord: {opt_letters[opts.index(correct)])}) {correct}"
-            # Fix double parentheses if any formatting oddities
-            q_text = q_text.replace("))", ")")
+            correct_letter = opt_letters[opts.index(correct)]
+            q_text = f"{len(questions)+1}. {template_sentence}\n{options_text}\nAntwoord: {correct_letter}) {correct}"
             questions.append(q_text)
             i += 1
 
     return "\n\n".join(questions[:amount])
-
 
 def generate_open_questions(text: str, amount: int = 10) -> str:
     """
@@ -284,7 +268,6 @@ def generate_open_questions(text: str, amount: int = 10) -> str:
         if len(questions) >= amount:
             break
         cloze = make_cloze_from_entity(ent_text, sentence)
-        # Turn into a question form: either fill-in or explain
         if ent_label in ("PERSON", "ORG", "GPE", "PROPN"):
             q = f"{len(questions)+1}. Vul in: {cloze}"
         elif ent_label in ("DATE",):
@@ -298,10 +281,8 @@ def generate_open_questions(text: str, amount: int = 10) -> str:
     for sent in sents:
         if len(questions) >= amount:
             break
-        # skip very short sentences
         if len(sent.split()) < 5:
             continue
-        # create question templates
         templates = [
             "{}. Vat de volgende zin samen in 1-2 zinnen: {}",
             "{}. Noem twee belangrijke punten uit de volgende zin: {}",
@@ -329,7 +310,6 @@ def generate_open_questions(text: str, amount: int = 10) -> str:
             questions.append(q)
             j += 1
 
-    # Ensure we return exactly 'amount' questions
     return "\n\n".join(questions[:amount])
 
 # --- Simple feedback checker (uses sentence-transformers if available) ---
@@ -347,14 +327,12 @@ def check_answer(correct: str, user: str) -> str:
                 return f"❌ Niet correct — similarity {score:.2f}"
         except Exception:
             pass
-    # fallback: simple substring / ratio
     corr = re.sub(r'\W+', ' ', correct.lower()).strip()
     us = re.sub(r'\W+', ' ', user.lower()).strip()
     if not corr or not us:
         return "Vul beide velden in."
     if corr in us or us in corr:
         return "✅ Goed (string match)"
-    # simple token overlap
     corr_set = set(corr.split())
     us_set = set(us.split())
     if not corr_set:
@@ -396,7 +374,6 @@ else:
         if not topic.strip():
             st.warning("Voer een onderwerp in.")
         else:
-            # For topic-only, create synthetic text to extract entities/keywords
             synthetic_text = (
                 f"{topic}. {topic} is een belangrijk onderwerp dat vaak wordt behandeld in lessen. "
                 f"Belangrijke aspecten van {topic} zijn beleid, geschiedenis, theorieën en voorbeelden."
@@ -419,4 +396,4 @@ if st.button("Geef feedback"):
     st.write(res)
 
 st.caption("Deze versie gebruikt heuristieken en spaCy om relevante vragen te genereren zonder een LLM. "
-           "Als je wilt, kan ik een version maken die uses a small instruction-tuned model for better quality (requires additional dependencies).")
+           "Als je wilt, kan ik een versie maken die een klein instruction-tuned model gebruikt voor betere kwaliteit (vereist extra dependencies).")

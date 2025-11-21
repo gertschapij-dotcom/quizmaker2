@@ -1,69 +1,89 @@
 """
-Streamlit Quiz App — Gemini (gemini-2.5-flash-lite) with API key input in the UI.
+QuizGen AI — Streamlit (Python) port of the provided React/TS project.
 
-How to use:
-- Paste your Google API key into the "Google API Key" field in the sidebar (password field).
-- Upload a text file or enter a subject, choose difficulty/number/type, then press "Generate Quiz".
-- The app will call gemini-2.5-flash-lite using the provided key. If generation/parsing fails, it falls back
-  to a built-in self-contained generator and shows diagnostics in the sidebar.
+Features:
+- Setup screen: paste Gemini / Google Generative API key (optional), choose mode (subject/context),
+  enter input, count, difficulty, and question type (multiple choice / open / mixed).
+- Generate quiz using Google Generative API (gemini-2.5-flash-lite preferred). If API key missing
+  or the cloud call fails, a local fallback generator is used.
+- Run through quiz (navigation, answer storage).
+- Submit and grade: grading via Google model when API key provided, otherwise fallback heuristic scoring.
+- Simple diagnostics shown in the sidebar when cloud calls fail.
 
-Dependencies:
-  pip install streamlit requests
 Run:
-  streamlit run streamlit_app.py
+  pip install -r requirements.txt
+  streamlit run app.py
+
+Notes:
+- This is a pragmatic single-file conversion from the React app you provided.
+- The app accepts a key in the UI (sidebar) for convenience. If you prefer to hide it, you can remove
+  the sidebar input and set GOOGLE_API_KEY via environment or Streamlit secrets.
 """
 from dataclasses import dataclass
 import json
-import random
 import re
+import random
+import os
+from typing import List, Optional, Dict, Any
 import requests
 import streamlit as st
-from typing import Any, Dict, List, Optional
-
-# Fixed model name
-GOOGLE_MODEL = "gemini-2.5-flash-lite"
 
 # -----------------------
-# Data structures
+# Data models
 # -----------------------
 @dataclass
-class QuizQuestion:
+class Question:
     id: int
-    type: str  # "multiple_choice" or "open"
-    prompt: str
-    choices: Optional[List[str]]
-    answer: str
-    explanation: str
+    text: str
+    type: str  # 'multiple_choice' | 'open_ended'
+    options: Optional[List[str]] = None
+
+@dataclass
+class GradingResult:
+    questionId: int
+    score: int  # 0-100
+    feedback: str
+    correctAnswer: str
 
 # -----------------------
-# Helpers
+# Configuration
+# -----------------------
+PREFERRED_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "text-bison-001"]
+TRY_ENDPOINTS = [
+    "https://generativelanguage.googleapis.com/v1/{model_path}:generateText?key={key}",
+    "https://generativelanguage.googleapis.com/v1beta2/{model_path}:generateText?key={key}"
+]
+
+# -----------------------
+# Utilities
 # -----------------------
 def extract_json(text: str) -> Optional[str]:
-    """Try to extract first valid JSON object/array from text."""
+    """Attempt to extract first JSON object/array in text."""
     if not text:
         return None
+    # look for {...} or [...]
     candidates = []
-    # Find {...} spans
+    # braces
     stack = []
     start = None
     for i, ch in enumerate(text):
         if ch == '{':
             if start is None:
                 start = i
-            stack.append(i)
+            stack.append('{')
         elif ch == '}' and stack:
             stack.pop()
             if not stack and start is not None:
                 candidates.append(text[start:i+1])
                 start = None
-    # Find [...] spans
+    # arrays
     stack = []
     start = None
     for i, ch in enumerate(text):
         if ch == '[':
             if start is None:
                 start = i
-            stack.append(i)
+            stack.append('[')
         elif ch == ']' and stack:
             stack.pop()
             if not stack and start is not None:
@@ -75,124 +95,96 @@ def extract_json(text: str) -> Optional[str]:
             return c
         except Exception:
             continue
-    # Last resort: try whole text
+    # try whole thing
     try:
         json.loads(text)
         return text
     except Exception:
         return None
 
-def simple_fallback_quiz(context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> List[QuizQuestion]:
-    """A small deterministic fallback quiz generator."""
+def simple_fallback_quiz(context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> List[Question]:
     source = (context_text or subject or "General knowledge").strip()
     sentences = re.split(r'(?<=[.!?])\s+', source)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-    qs: List[QuizQuestion] = []
+    qs = []
     for i in range(n_questions):
         sent = sentences[i] if i < len(sentences) else (subject or "This subject") + " overview."
-        q_prompt = sent.rstrip('.')
+        q_text = sent.rstrip('.')
         if q_type == "multiple_choice":
             words = re.findall(r"\w+", sent)
             key = words[-1] if words else "concept"
             choices = [key, key + "s", "another concept", "not related"]
             random.shuffle(choices)
-            answer = choices[0]
-            explanation = f"Important term: {key}. Source: {sent}"
-            qs.append(QuizQuestion(id=i+1, type="multiple_choice", prompt=f"What is an important fact in this statement: {q_prompt}?", choices=choices, answer=answer, explanation=explanation))
-        else:
-            answer = sent
-            explanation = f"Key points: {sent}"
-            qs.append(QuizQuestion(id=i+1, type="open", prompt=f"What is an important fact in this statement: {q_prompt}?", choices=None, answer=answer, explanation=explanation))
+            qs.append(Question(id=i+1, text=f"What is an important fact in this statement: {q_text}?", type="multiple_choice", options=choices))
+        elif q_type == "open_ended":
+            qs.append(Question(id=i+1, text=f"What is an important fact in this statement: {q_text}?", type="open_ended", options=None))
+        else:  # mixed
+            if i % 2 == 0:
+                words = re.findall(r"\w+", sent)
+                key = words[-1] if words else "concept"
+                choices = [key, key + "s", "another concept", "not related"]
+                random.shuffle(choices)
+                qs.append(Question(id=i+1, text=f"What is an important fact in this statement: {q_text}?", type="multiple_choice", options=choices))
+            else:
+                qs.append(Question(id=i+1, text=f"What is an important fact in this statement: {q_text}?", type="open_ended", options=None))
     return qs
 
-def simple_fallback_grade(reference: str, student_answer: str) -> Dict[str, Any]:
-    ref_words = set(re.findall(r"\w+", reference.lower()))
-    stud_words = set(re.findall(r"\w+", student_answer.lower()))
-    common = ref_words & stud_words
-    score = int(100 * len(common) / len(ref_words)) if ref_words else 0
-    feedback = f"Fallback grading: {len(common)} overlapping keywords. Reference: {reference}"
-    return {"score": score, "feedback": feedback}
+def simple_fallback_grade(questions: List[Question], answers: Dict[int, str]) -> List[GradingResult]:
+    results = []
+    for q in questions:
+        ref = q.text
+        stud = answers.get(q.id, "").strip().lower()
+        if q.type == "multiple_choice" and q.options:
+            correct = q.options[0]  # fallback: first option
+            score = 100 if stud and stud == correct else 0
+            feedback = "Correct." if score == 100 else f"Incorrect. Expected: {correct}"
+            results.append(GradingResult(questionId=q.id, score=score, feedback=feedback, correctAnswer=correct))
+        else:
+            ref_words = set(re.findall(r"\w+", ref.lower()))
+            stud_words = set(re.findall(r"\w+", stud.lower()))
+            common = ref_words & stud_words
+            score = int(100 * len(common) / len(ref_words)) if ref_words else 0
+            feedback = f"Fallback grading: {len(common)} overlapping key words."
+            results.append(GradingResult(questionId=q.id, score=score, feedback=feedback, correctAnswer=ref))
+    return results
 
 # -----------------------
-# Prompt builders
-# -----------------------
-def build_generation_prompt(context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> str:
-    source = context_text if context_text else f"Subject: {subject}"
-    prompt = f"""You are a helpful quiz writer. Create a quiz of {n_questions} question(s) in JSON format ONLY.
-Context:
-\"\"\"{source}\"\"\"
-
-Difficulty: {difficulty}
-Question type preference: {q_type}
-
-IMPORTANT: Output ONLY valid JSON and nothing else. The top-level structure must be:
-{{ "questions": [ ... ] }}
-
-Each question must include:
-- "id": integer
-- "type": "multiple_choice" or "open"
-- "prompt": question text
-- "choices": array of strings (for multiple_choice) or null/omit for open
-- "answer": for multiple_choice the exact correct choice text; for open a short model answer/keypoints
-- "explanation": detailed explanation to be shown after answering
-
-Do not add commentary, labels, or any non-JSON text."""
-    return prompt
-
-def build_grading_prompt(question: str, reference: str, student_answer: str, difficulty: str) -> str:
-    return f"""You are an objective grader. Grade the student's answer from 0 to 100 based on correctness and completeness relative to the reference answer.
-Question: {question}
-Reference / expected answer: {reference}
-Student answer: {student_answer}
-Difficulty: {difficulty}
-
-Return ONLY valid JSON like: {{ "score": <int 0-100>, "feedback": "<detailed feedback explaining strengths, weaknesses, and how to improve>" }}"""
-
-# -----------------------
-# Google Generative calls (tries v1 and v1beta2)
+# Google Generative API interaction (models fallback & diagnostics)
 # -----------------------
 def call_google_generate(model: str, api_key: str, prompt_text: str, max_output_tokens: int = 1024, temperature: float = 0.0, timeout: int = 60) -> Optional[str]:
-    """Call Google Generative Language API using the provided API key. Writes diagnostics to sidebar."""
+    """
+    Try a model using v1 and v1beta2 endpoints. Return string output or None.
+    Adds diagnostics to sidebar if available.
+    """
     if not api_key:
         return None
-
     model_path = model if model.startswith("models/") else f"models/{model}"
-    endpoints = [
-        f"https://generativelanguage.googleapis.com/v1/{model_path}:generateText?key={api_key}",
-        f"https://generativelanguage.googleapis.com/v1beta2/{model_path}:generateText?key={api_key}"
-    ]
-
+    headers = {"Content-Type": "application/json"}
+    body = {"prompt": {"text": prompt_text}, "temperature": temperature, "maxOutputTokens": max_output_tokens}
     last_status = None
-    last_text = None
-
-    for url in endpoints:
+    last_body = None
+    for endpoint_template in TRY_ENDPOINTS:
+        url = endpoint_template.format(model_path=model_path, key=api_key)
         try:
-            headers = {"Content-Type": "application/json"}
-            body = {"prompt": {"text": prompt_text}, "temperature": temperature, "maxOutputTokens": max_output_tokens}
             resp = requests.post(url, headers=headers, json=body, timeout=timeout)
             status = resp.status_code
             text = resp.text
             last_status = status
-            last_text = text
-
-            # show diagnostics in sidebar (helpful)
+            last_body = text
+            # Diagnostics
             try:
                 st.sidebar.markdown(f"**Google endpoint tried:** `{url}`")
                 st.sidebar.markdown(f"**HTTP status:** `{status}`")
                 st.sidebar.text_area("Raw Google response (truncated)", value=(text[:4000] + ("...[truncated]" if len(text) > 4000 else "")), height=220)
             except Exception:
-                # fallback: print to console
-                print("Google endpoint tried:", url)
-                print("Status:", status)
-                print("Body:", text[:2000])
-
+                # ignore sidebar failures
+                pass
             if not resp.ok:
                 continue
-
             data = resp.json()
             if isinstance(data, dict):
                 if data.get("error"):
-                    last_text = json.dumps(data)
+                    last_body = json.dumps(data)
                     continue
                 candidates = data.get("candidates") or data.get("responses") or []
                 if isinstance(candidates, list) and len(candidates) > 0:
@@ -203,17 +195,17 @@ def call_google_generate(model: str, api_key: str, prompt_text: str, max_output_
                                 return first.get(k)
                     if isinstance(first, str) and first.strip():
                         return first
-            # fallback: find first string anywhere
-            def find_string(o):
-                if isinstance(o, str):
-                    return o
-                if isinstance(o, dict):
-                    for v in o.values():
+            # fallback: find any string in JSON
+            def find_string(obj):
+                if isinstance(obj, str):
+                    return obj
+                if isinstance(obj, dict):
+                    for v in obj.values():
                         s = find_string(v)
                         if s:
                             return s
-                if isinstance(o, list):
-                    for e in o:
+                if isinstance(obj, list):
+                    for e in obj:
                         s = find_string(e)
                         if s:
                             return s
@@ -224,254 +216,345 @@ def call_google_generate(model: str, api_key: str, prompt_text: str, max_output_
             return text
         except Exception as e:
             last_status = "exception"
-            last_text = str(e)
+            last_body = str(e)
             try:
                 st.sidebar.error(f"Google call exception: {e}")
             except Exception:
-                print("Google call exception:", e)
+                pass
             continue
-
-    # all endpoints tried and failed
+    # All endpoints attempted
     try:
         st.sidebar.error(f"All Google endpoints failed. Last status: {last_status}")
-        st.sidebar.text_area("Last Google response body (debug)", value=(last_text or "no body"), height=220)
+        st.sidebar.text_area("Last Google response body (debug)", value=(last_body or "no body"), height=220)
     except Exception:
-        print("All Google endpoints failed. Last status:", last_status)
-        print("Last body:", last_text)
+        pass
     return None
 
-def generate_quiz_with_google(api_key: str, context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> Optional[List[QuizQuestion]]:
+def generate_quiz_with_google(api_key: str, context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> Optional[List[Question]]:
     if not api_key:
         return None
     prompt = build_generation_prompt(context_text, subject, difficulty, n_questions, q_type)
-    text = call_google_generate(GOOGLE_MODEL, api_key, prompt, max_output_tokens=1024, temperature=0.0)
-    if not text:
-        return None
-    json_str = extract_json(text) or text
-    try:
-        parsed = json.loads(json_str)
-        qs: List[QuizQuestion] = []
-        for q in parsed.get("questions", []):
-            qid = int(q.get("id", len(qs)+1))
-            qtype = q.get("type", "open")
-            prompt_text = q.get("prompt", "").strip()
-            choices = q.get("choices", None)
-            answer = q.get("answer", "")
-            explanation = q.get("explanation", "")
-            qs.append(QuizQuestion(id=qid, type=qtype, prompt=prompt_text, choices=choices, answer=answer, explanation=explanation))
-        if len(qs) > n_questions:
-            qs = qs[:n_questions]
-        return qs
-    except Exception:
+    # try preferred models in order; on 404 try next model
+    last_text = None
+    for model in PREFERRED_MODELS:
+        text = call_google_generate(model, api_key, prompt, max_output_tokens=1024, temperature=0.0)
+        if not text:
+            continue
+        last_text = text
+        json_str = extract_json(text) or text
         try:
-            st.sidebar.text_area("Failed to parse JSON from model output (raw):", value=text, height=300)
+            parsed = json.loads(json_str)
+            if isinstance(parsed, list):
+                questions = []
+                for q in parsed:
+                    qid = int(q.get("id", len(questions) + 1))
+                    qtype = q.get("type", "open_ended")
+                    qtext = q.get("text") or q.get("prompt") or ""
+                    options = q.get("options") or q.get("choices") or None
+                    questions.append(Question(id=qid, text=qtext, type=qtype, options=options))
+                return questions[:n_questions]
+            # support {"questions": [...]}
+            if isinstance(parsed, dict) and parsed.get("questions"):
+                parsed_list = parsed.get("questions")
+                questions = []
+                for q in parsed_list:
+                    qid = int(q.get("id", len(questions) + 1))
+                    qtype = q.get("type", "open_ended")
+                    qtext = q.get("text") or q.get("prompt") or ""
+                    options = q.get("options") or q.get("choices") or None
+                    questions.append(Question(id=qid, text=qtext, type=qtype, options=options))
+                return questions[:n_questions]
         except Exception:
-            print("Failed to parse JSON from model output. Raw text:", text)
-        return None
+            # if parse fails, continue to next model
+            try:
+                st.sidebar.text_area("Failed to parse JSON from model output (raw):", value=text, height=300)
+            except Exception:
+                pass
+            continue
+    return None
 
-def grade_open_answer_with_google(api_key: str, question: str, reference: str, student_answer: str, difficulty: str) -> Dict[str, Any]:
+def grade_with_google(api_key: str, questions: List[Question], answers: Dict[int,str], original_context: str) -> Optional[List[GradingResult]]:
     if not api_key:
-        return simple_fallback_grade(reference, student_answer)
-    prompt = build_grading_prompt(question, reference, student_answer, difficulty)
-    text = call_google_generate(GOOGLE_MODEL, api_key, prompt, max_output_tokens=400, temperature=0.0)
-    if not text:
-        return {"score": 0, "feedback": "Grading failed (no response from Google)."}
-    json_str = extract_json(text) or text
-    try:
-        parsed = json.loads(json_str)
-        score = int(parsed.get("score", 0))
-        feedback = parsed.get("feedback", "")
-        return {"score": score, "feedback": feedback}
-    except Exception:
-        return simple_fallback_grade(reference, student_answer)
+        return None
+    payload = []
+    for q in questions:
+        payload.append({
+            "questionId": q.id,
+            "questionText": q.text,
+            "userAnswer": answers.get(q.id, "(No Answer)"),
+            "type": q.type
+        })
+    prompt = build_grading_prompt(payload, original_context)
+    for model in PREFERRED_MODELS:
+        text = call_google_generate(model, api_key, prompt, max_output_tokens=512, temperature=0.0)
+        if not text:
+            continue
+        json_str = extract_json(text) or text
+        try:
+            parsed = json.loads(json_str)
+            results = []
+            if isinstance(parsed, list):
+                for r in parsed:
+                    qid = int(r.get("questionId"))
+                    score = int(r.get("score", 0))
+                    feedback = r.get("feedback","")
+                    correct = r.get("correctAnswer") or r.get("correct_answer") or ""
+                    results.append(GradingResult(questionId=qid, score=score, feedback=feedback, correctAnswer=correct))
+                return results
+            # tolerate dict-shaped responses
+            if isinstance(parsed, dict) and parsed.get("results"):
+                for r in parsed.get("results"):
+                    qid = int(r.get("questionId"))
+                    score = int(r.get("score", 0))
+                    feedback = r.get("feedback","")
+                    correct = r.get("correctAnswer") or r.get("correct_answer") or ""
+                    results.append(GradingResult(questionId=qid, score=score, feedback=feedback, correctAnswer=correct))
+                return results
+        except Exception:
+            try:
+                st.sidebar.text_area("Failed to parse grading JSON (raw):", value=text, height=300)
+            except Exception:
+                pass
+            continue
+    return None
+
+# -----------------------
+# Prompt builders
+# -----------------------
+def build_generation_prompt(context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> str:
+    source = context_text if context_text else f"Subject: {subject}"
+    type_instruction = ""
+    if q_type == "multiple_choice":
+        type_instruction = "All questions must be multiple choice with 4 options."
+    elif q_type == "open_ended":
+        type_instruction = "All questions must be open-ended textual questions."
+    else:
+        type_instruction = "Mix multiple choice and open-ended questions evenly."
+
+    prompt = f"""
+You are a helpful quiz writer. Create a quiz of {n_questions} question(s) in JSON format ONLY.
+Context:
+\"\"\"{source}\"\"\"
+
+Difficulty: {difficulty}
+Question type preference: {q_type}
+
+IMPORTANT: Output ONLY valid JSON and nothing else.
+Return either a JSON array of question objects, or an object with a top-level "questions" array.
+
+Each question object must contain:
+- "id": integer
+- "type": "multiple_choice" or "open_ended"
+- "text": the question text
+- "options": array of strings (for multiple_choice) or empty/null for open_ended
+
+Do not add any explanation fields in generation output. Keep it strictly JSON.
+{type_instruction}
+"""
+    return prompt
+
+def build_grading_prompt(payload: List[Dict[str, Any]], original_context: str) -> str:
+    return f"""
+You are a strict but fair grader. Grade each answer from 0 to 100 and provide concise feedback and the correct answer.
+
+Context:
+\"\"\"{original_context}\"\"\"
+
+Quiz Data:
+{json.dumps(payload, indent=2)}
+
+Return a JSON array where each element is an object with:
+- "questionId": integer
+- "score": integer 0-100
+- "feedback": string
+- "correctAnswer": string
+
+Output only valid JSON.
+"""
 
 # -----------------------
 # Streamlit UI
 # -----------------------
-st.set_page_config(page_title="Quiz Generator — Gemini (UI key)", layout="wide")
-st.title("Quiz Generator — Gemini (gemini-2.5-flash-lite)")
+st.set_page_config(page_title="QuizGen AI (Python)", layout="wide")
+st.title("QuizGen AI — Python / Streamlit port")
 
-st.sidebar.header("Google API Key (paste here)")
-st.sidebar.markdown("Paste your Google API key below. It will be used for calls to the Gemini model. If missing or invalid the app will fall back to a local fallback generator.")
-google_api_key = st.sidebar.text_input("Google API Key", type="password")
+# Sidebar: API key + basic diagnostics
+st.sidebar.header("Google API / Gemini Key")
+st.sidebar.info("Paste a Google Generative API key (optional). If provided the app will attempt to use Gemini / text-bison models for generation and grading. If omitted, a local fallback will be used.")
+ui_api_key = st.sidebar.text_input("Google API Key (paste here)", type="password")
+if ui_api_key:
+    st.sidebar.success("API key provided (not shown).")
 
+# Setup form
 st.sidebar.markdown("---")
-st.sidebar.header("Quiz Source")
-source_choice = st.sidebar.radio("Create quiz from:", ("Upload text file", "Subject / short description"))
-uploaded_text = ""
-subject_line = ""
-if source_choice == "Upload text file":
-    uploaded_file = st.sidebar.file_uploader("Upload a large text file (txt, md). For PDFs, copy content into a .txt.", type=["txt", "md"])
-    if uploaded_file is not None:
-        try:
-            raw = uploaded_file.read()
-            if isinstance(raw, bytes):
-                try:
-                    uploaded_text = raw.decode("utf-8")
-                except Exception:
-                    uploaded_text = raw.decode("latin-1", errors="ignore")
-            else:
-                uploaded_text = str(raw)
-            st.sidebar.success("File loaded.")
-        except Exception as e:
-            st.sidebar.error(f"Could not read file: {e}")
+st.sidebar.header("Quiz Setup")
+mode = st.sidebar.radio("Source mode", ("subject", "context"))
+if mode == "subject":
+    subject = st.sidebar.text_input("Subject (short)", value="Photosynthesis")
+    context_text = ""
 else:
-    subject_line = st.sidebar.text_input("Subject or short description", value="Photosynthesis and how plants convert light into energy")
+    context_text = st.sidebar.text_area("Paste context text", height=220)
+    subject = ""
 
-st.sidebar.header("Quiz Settings")
-difficulty = st.sidebar.selectbox("Difficulty", ["easy", "medium", "hard"])
-n_questions = st.sidebar.slider("Number of questions", 1, 20, 5)
-q_type = st.sidebar.selectbox("Question type", ["multiple_choice", "open", "mix"])
+question_count = st.sidebar.slider("Number of questions", min_value=1, max_value=20, value=5)
+difficulty = st.sidebar.selectbox("Difficulty", ("easy", "medium", "hard"))
+q_type = st.sidebar.selectbox("Question type", ("mixed", "multiple_choice", "open_ended"))
 randomize = st.sidebar.checkbox("Randomize question order", value=True)
+test_key = st.sidebar.button("Test API Key")
 
-# Test button to run a quick verification call
-if st.sidebar.button("Test API Key"):
-    if not google_api_key:
-        st.sidebar.error("No API key provided in the UI. Paste the key and try again.")
+# persist state
+if "state" not in st.session_state:
+    st.session_state.state = {
+        "questions": [],
+        "answers": {},
+        "results": None,
+        "current": 0,
+        "is_generating": False,
+        "is_grading": False,
+        "error": None,
+        "api_ok": False
+    }
+
+state = st.session_state.state
+
+# Test API key button action
+if test_key:
+    if not ui_api_key:
+        st.sidebar.error("Please paste a key into the field first.")
     else:
+        st.sidebar.info("Testing key using text-bison-001 (or trying Gemini) ...")
         test_prompt = 'Respond with only the JSON: {"ok": true}'
-        out = call_google_generate(GOOGLE_MODEL, google_api_key, test_prompt, max_output_tokens=64, temperature=0.0)
-        if out:
-            js = extract_json(out)
-            if js:
-                try:
-                    parsed = json.loads(js)
-                    if isinstance(parsed, dict) and parsed.get("ok") is True:
-                        st.sidebar.success("Test succeeded: model returned expected JSON.")
-                    else:
-                        st.sidebar.warning("Test returned content but not the exact JSON requested. See raw response above.")
-                except Exception:
-                    st.sidebar.warning("Received response but failed to parse JSON. See raw response above.")
+        out = call_google_generate(PREFERRED_MODELS[0], ui_api_key, test_prompt, max_output_tokens=64, temperature=0.0)
+        if not out:
+            # try text-bison as explicit test if preferred model failed
+            out2 = call_google_generate("text-bison-001", ui_api_key, test_prompt, max_output_tokens=64, temperature=0.0)
+            if out2:
+                st.sidebar.success("Key appears to work with text-bison-001 (fallback).")
+                state["api_ok"] = True
             else:
-                st.sidebar.info("Received non-JSON response from model. See raw response above.")
+                st.sidebar.error("No usable response from Google Generative API. Check key, API enablement, and billing.")
+                state["api_ok"] = False
         else:
-            st.sidebar.error("No response from Google. See the raw response diagnostics in the sidebar.")
+            st.sidebar.success("API key produced a response (inspect sidebar diagnostics above).")
+            state["api_ok"] = True
 
-# Generate quiz button
-generate_button = st.sidebar.button("Generate Quiz")
+# Generate quiz action
+if st.sidebar.button("Generate Quiz"):
+    state["questions"] = []
+    state["answers"] = {}
+    state["results"] = None
+    state["current"] = 0
+    state["error"] = None
+    state["is_generating"] = True
 
-# Session state
-if "quiz" not in st.session_state:
-    st.session_state["quiz"] = None
-if "answers" not in st.session_state:
-    st.session_state["answers"] = {}
-if "feedback" not in st.session_state:
-    st.session_state["feedback"] = None
-
-if generate_button:
-    st.session_state["answers"] = {}
-    st.session_state["feedback"] = None
-    context_text = uploaded_text.strip() if uploaded_text else ""
-    subject = subject_line.strip() if subject_line else ""
-    if not context_text and not subject:
-        st.sidebar.error("Please provide an uploaded text file or a subject line.")
-    else:
-        with st.spinner("Generating quiz..."):
-            qs: Optional[List[QuizQuestion]] = None
-            if google_api_key:
-                qs = generate_quiz_with_google(google_api_key, context_text, subject, difficulty, n_questions, q_type)
-                if qs is None:
-                    st.warning("Google generation failed or returned invalid output. Falling back to internal generator.")
+    # call cloud if key provided, else fallback
+    try:
+        qs = None
+        if ui_api_key:
+            qs = generate_quiz_with_google(ui_api_key, context_text, subject, difficulty, question_count, q_type)
             if qs is None:
-                qs = simple_fallback_quiz(context_text, subject, difficulty, n_questions, q_type if q_type != "mix" else "mixed")
-            if randomize:
-                random.shuffle(qs)
-            st.session_state["quiz"] = qs
-            st.success(f"Generated {len(qs)} question(s).")
+                st.warning("Cloud generation failed or returned invalid output; falling back to local generator.")
+        if qs is None:
+            qs = simple_fallback_quiz(context_text, subject, difficulty, question_count, q_type)
+        if randomize:
+            random.shuffle(qs)
+        state["questions"] = qs
+        state["is_generating"] = False
+    except Exception as e:
+        state["error"] = str(e)
+        state["is_generating"] = False
+        st.error(f"Failed to generate quiz: {e}")
 
-# Display quiz and collect answers
-quiz = st.session_state.get("quiz")
-if quiz:
-    st.header("Quiz")
-    form = st.form(key="quiz_form")
-    answers: Dict[str, str] = {}
-    for q in quiz:
-        with st.expander(f"Question {q.id}: {q.type}", expanded=True):
-            st.write(q.prompt)
-            if q.type == "multiple_choice":
-                choices = q.choices or ["A", "B", "C", "D"]
-                selected = form.radio(f"Select answer for Q{q.id}", choices, key=f"q_{q.id}")
-                answers[str(q.id)] = selected
-            else:
-                txt = form.text_area(f"Your answer for Q{q.id}", key=f"q_{q.id}", height=120)
-                answers[str(q.id)] = txt
-    submit = form.form_submit_button("Submit Answers")
-    if submit:
-        st.session_state["answers"] = answers
-        total_score = 0
-        max_score = 0
-        feedback_list = []
-        with st.spinner("Grading..."):
-            for q in quiz:
-                user_ans = answers.get(str(q.id), "")
-                if q.type == "multiple_choice":
-                    max_score += 1
-                    is_correct = False
-                    if isinstance(q.answer, str) and user_ans.strip().lower() == q.answer.strip().lower():
-                        is_correct = True
-                    if not is_correct and q.choices:
-                        try:
-                            idx = int(q.answer) - 1
-                            if 0 <= idx < len(q.choices) and q.choices[idx].strip().lower() == user_ans.strip().lower():
-                                is_correct = True
-                        except Exception:
-                            pass
-                    score = 1 if is_correct else 0
-                    total_score += score
-                    fb = {
-                        "id": q.id,
-                        "type": q.type,
-                        "question": q.prompt,
-                        "your_answer": user_ans,
-                        "correct_answer": q.answer,
-                        "is_correct": is_correct,
-                        "explanation": q.explanation
-                    }
-                    feedback_list.append(fb)
-                else:
-                    max_score += 100
-                    if google_api_key:
-                        grade = grade_open_answer_with_google(google_api_key, q.prompt, q.answer, user_ans, difficulty)
-                    else:
-                        grade = simple_fallback_grade(q.answer, user_ans)
-                    score = int(grade.get("score", 0))
-                    total_score += score
-                    fb = {
-                        "id": q.id,
-                        "type": q.type,
-                        "question": q.prompt,
-                        "your_answer": user_ans,
-                        "score": score,
-                        "feedback": grade.get("feedback", ""),
-                        "explanation": q.explanation
-                    }
-                    feedback_list.append(fb)
-        overall_percent = int(100 * total_score / max_score) if max_score > 0 else 0
-        st.session_state["feedback"] = {"overall_percent": overall_percent, "details": feedback_list}
-        st.success(f"Grading complete — Score: {overall_percent}%")
+# Main rendering logic
+def show_setup():
+    st.markdown("### Get started")
+    st.write("Use the sidebar to paste an API key (optional), provide a subject or context, and configure the quiz. Click Generate Quiz to begin.")
 
-# Show feedback
-fb = st.session_state.get("feedback")
-if fb:
-    st.header("Detailed Feedback")
-    st.write(f"Overall score: {fb['overall_percent']}%")
-    for item in fb["details"]:
-        st.markdown(f"### Question {item['id']}")
-        st.write(item["question"])
-        if item["type"] == "multiple_choice":
-            st.write(f"- Your answer: **{item['your_answer']}**")
-            correctness = "Correct ✅" if item.get("is_correct") else "Incorrect ❌"
-            st.write(f"- Result: **{correctness}**")
-            st.write(f"- Correct answer: **{item.get('correct_answer', '—')}**")
-            st.write(f"- Explanation: {item.get('explanation', '')}")
-        else:
-            st.write(f"- Your answer (submitted):")
-            st.write(item.get("your_answer", ""))
-            st.write(f"- Score: **{item.get('score', 0)} / 100**")
-            st.write(f"- Feedback: {item.get('feedback', '')}")
-            st.write(f"- Reference explanation: {item.get('explanation', '')}")
-    st.markdown("---")
-    st.button("Regenerate quiz or try again", on_click=lambda: st.session_state.update({"quiz": None, "answers": {}, "feedback": None}))
+def show_quiz_runner():
+    questions: List[Question] = state["questions"]
+    if not questions:
+        show_setup()
+        return
+    idx = state["current"]
+    q = questions[idx]
+    st.header(f"Question {idx+1} of {len(questions)}")
+    st.subheader(q.text)
+    if q.type == "multiple_choice" and q.options:
+        # show options as buttons
+        for opt in q.options:
+            sel = st.radio("Options", q.options, index=q.options.index(state["answers"].get(q.id, q.options[0])) if state["answers"].get(q.id) in (q.options or []) else 0, key=f"radio_{q.id}")
+        # store selected
+        state["answers"][q.id] = st.session_state.get(f"radio_{q.id}", state["answers"].get(q.id, ""))
+    else:
+        txt = st.text_area("Your answer", value=state["answers"].get(q.id, ""), key=f"answer_{q.id}", height=160)
+        state["answers"][q.id] = st.session_state.get(f"answer_{q.id}", txt)
 
-st.markdown("----")
-st.write("Notes: Paste your Google API key into the sidebar field. Use the 'Test API Key' button to run a minimal check (diagnostics appear in the sidebar). If Google generation fails the app falls back to a built-in generator so you can continue.")
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        if st.button("Previous", disabled=(idx==0)):
+            state["current"] = max(0, idx-1)
+    with col2:
+        if st.button("Next", disabled=(idx==len(questions)-1)):
+            state["current"] = min(len(questions)-1, idx+1)
+    with col3:
+        if st.button("Submit & Grade", disabled=False if len(questions)>0 else True):
+            # grade
+            state["is_grading"] = True
+            st.experimental_rerun()
+
+def show_results():
+    results: List[GradingResult] = state["results"] or []
+    questions: List[Question] = state["questions"]
+    if not results:
+        st.write("No results to show.")
+        return
+    total = round(sum(r.score for r in results) / len(results))
+    st.markdown(f"## Final Score: **{total}%**")
+    for r in results:
+        q = next((x for x in questions if x.id == r.questionId), None)
+        if not q:
+            continue
+        st.markdown(f"### Q{r.questionId}: {q.text}")
+        st.write(f"- Score: **{r.score} / 100**")
+        st.write(f"- AI feedback: {r.feedback}")
+        if r.score < 100:
+            st.write(f"- Correct answer: **{r.correctAnswer}**")
+    if st.button("Create New Quiz"):
+        state["questions"] = []
+        state["answers"] = {}
+        state["results"] = None
+        state["current"] = 0
+        state["error"] = None
+        st.experimental_rerun()
+
+# If grading requested
+if state["is_grading"]:
+    # grade now
+    try:
+        generated_results = None
+        if ui_api_key:
+            generated_results = grade_with_google(ui_api_key, state["questions"], state["answers"], context_text or subject)
+            if generated_results is None:
+                st.warning("Cloud grading failed or returned invalid output; using fallback grading.")
+        if generated_results is None:
+            generated_results = simple_fallback_grade(state["questions"], state["answers"])
+        state["results"] = generated_results
+        state["is_grading"] = False
+        st.experimental_rerun()
+    except Exception as e:
+        state["error"] = str(e)
+        state["is_grading"] = False
+        st.error(f"Failed to grade: {e}")
+
+# Render screens
+if state["results"]:
+    show_results()
+else:
+    if not state["questions"]:
+        show_setup()
+    else:
+        show_quiz_runner()
+
+# show errors if any
+if state.get("error"):
+    st.error(state["error"])

@@ -1,33 +1,27 @@
 """
-Streamlit Quiz App — fixed Google model (Gemini 2.5 Flash Lite)
+Streamlit Quiz App — Gemini (gemini-2.5-flash-lite) with API key input in the UI.
 
-This version uses the fixed model "gemini-2.5-flash-lite" and improves diagnostics and parsing
-to avoid silent failures that returned None/404/400 before.
+How to use:
+- Paste your Google API key into the "Google API Key" field in the sidebar (password field).
+- Upload a text file or enter a subject, choose difficulty/number/type, then press "Generate Quiz".
+- The app will call gemini-2.5-flash-lite using the provided key. If generation/parsing fails, it falls back
+  to a built-in self-contained generator and shows diagnostics in the sidebar.
 
-API key is NOT requested in the UI. The app looks for the key in this order:
-  1) st.secrets["GOOGLE_API_KEY"]  (recommended for Streamlit Cloud / local .streamlit/secrets.toml)
-  2) environment variable GOOGLE_API_KEY
-
-If no key is found or the call fails, the app falls back to an internal self-contained generator/grader.
-
-Notes:
-- I added robust endpoint handling (tries /v1 then /v1beta2), detailed sidebar debug output
-  when Google responses fail, and more tolerant JSON extraction.
-- Keep your key in st.secrets or as an environment variable. Do not paste it into the UI.
+Dependencies:
+  pip install streamlit requests
+Run:
+  streamlit run streamlit_app.py
 """
 from dataclasses import dataclass
 import json
 import random
 import re
-import os
 import requests
 import streamlit as st
 from typing import Any, Dict, List, Optional
 
-# -----------------------
-# Configuration (fixed model)
-# -----------------------
-GOOGLE_MODEL = "gemini-2.5-flash-lite"  # fixed model, no UI option to change
+# Fixed model name
+GOOGLE_MODEL = "gemini-2.5-flash-lite"
 
 # -----------------------
 # Data structures
@@ -37,20 +31,19 @@ class QuizQuestion:
     id: int
     type: str  # "multiple_choice" or "open"
     prompt: str
-    choices: Optional[List[str]]  # only for multiple choice
-    answer: str  # canonical/expected answer (for MC this is the correct choice text or index)
-    explanation: str  # detailed explanation / answer key
+    choices: Optional[List[str]]
+    answer: str
+    explanation: str
 
 # -----------------------
-# Helper: JSON extraction
+# Helpers
 # -----------------------
 def extract_json(text: str) -> Optional[str]:
-    """Attempt to find the first valid JSON object/array in text."""
+    """Try to extract first valid JSON object/array from text."""
     if not text:
         return None
     candidates = []
-    # {...} spans
-    brace_spans = []
+    # Find {...} spans
     stack = []
     start = None
     for i, ch in enumerate(text):
@@ -61,12 +54,9 @@ def extract_json(text: str) -> Optional[str]:
         elif ch == '}' and stack:
             stack.pop()
             if not stack and start is not None:
-                brace_spans.append((start, i + 1))
+                candidates.append(text[start:i+1])
                 start = None
-    for s, e in brace_spans:
-        candidates.append(text[s:e])
-    # [...] spans
-    arr_spans = []
+    # Find [...] spans
     stack = []
     start = None
     for i, ch in enumerate(text):
@@ -77,64 +67,50 @@ def extract_json(text: str) -> Optional[str]:
         elif ch == ']' and stack:
             stack.pop()
             if not stack and start is not None:
-                arr_spans.append((start, i + 1))
+                candidates.append(text[start:i+1])
                 start = None
-    for s, e in arr_spans:
-        candidates.append(text[s:e])
-    # try to parse candidates
     for c in candidates:
         try:
             json.loads(c)
             return c
         except Exception:
             continue
-    # try whole text as last resort
+    # Last resort: try whole text
     try:
         json.loads(text)
         return text
     except Exception:
         return None
 
-# -----------------------
-# Built-in fallback generator/grader
-# -----------------------
 def simple_fallback_quiz(context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> List[QuizQuestion]:
-    """
-    Simple internal quiz generator producing basic MC or open questions.
-    """
+    """A small deterministic fallback quiz generator."""
     source = (context_text or subject or "General knowledge").strip()
     sentences = re.split(r'(?<=[.!?])\s+', source)
     sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-    questions: List[QuizQuestion] = []
+    qs: List[QuizQuestion] = []
     for i in range(n_questions):
-        if i < len(sentences):
-            sent = sentences[i]
-        else:
-            sent = (subject or "This subject") + " overview."
-        q_text = sent.rstrip('.')
-        q_prompt = f"What is an important fact or idea in this statement: {q_text}?"
+        sent = sentences[i] if i < len(sentences) else (subject or "This subject") + " overview."
+        q_prompt = sent.rstrip('.')
         if q_type == "multiple_choice":
             words = re.findall(r"\w+", sent)
             key = words[-1] if words else "concept"
             choices = [key, key + "s", "another concept", "not related"]
             random.shuffle(choices)
-            correct = choices[0]
-            explanation = f"The important term is '{key}' based on the sentence: \"{sent}\"."
-            questions.append(QuizQuestion(id=i+1, type="multiple_choice", prompt=q_prompt, choices=choices, answer=correct, explanation=explanation))
+            answer = choices[0]
+            explanation = f"Important term: {key}. Source: {sent}"
+            qs.append(QuizQuestion(id=i+1, type="multiple_choice", prompt=f"What is an important fact in this statement: {q_prompt}?", choices=choices, answer=answer, explanation=explanation))
         else:
-            explanation = f"A good answer should refer to: {sent}"
-            questions.append(QuizQuestion(id=i+1, type="open", prompt=q_prompt, choices=None, answer=sent, explanation=explanation))
-    return questions
+            answer = sent
+            explanation = f"Key points: {sent}"
+            qs.append(QuizQuestion(id=i+1, type="open", prompt=f"What is an important fact in this statement: {q_prompt}?", choices=None, answer=answer, explanation=explanation))
+    return qs
 
 def simple_fallback_grade(reference: str, student_answer: str) -> Dict[str, Any]:
     ref_words = set(re.findall(r"\w+", reference.lower()))
     stud_words = set(re.findall(r"\w+", student_answer.lower()))
     common = ref_words & stud_words
-    if not ref_words:
-        score = 0
-    else:
-        score = int(100 * len(common) / len(ref_words))
-    feedback = f"Fallback grading: {len(common)} overlapping key words. Expected key points: {reference}"
+    score = int(100 * len(common) / len(ref_words)) if ref_words else 0
+    feedback = f"Fallback grading: {len(common)} overlapping keywords. Reference: {reference}"
     return {"score": score, "feedback": feedback}
 
 # -----------------------
@@ -149,20 +125,18 @@ Context:
 Difficulty: {difficulty}
 Question type preference: {q_type}
 
-Output MUST be valid JSON. Output a top-level object like: {{
-  "questions": [ ... ]
-}}
+IMPORTANT: Output ONLY valid JSON and nothing else. The top-level structure must be:
+{{ "questions": [ ... ] }}
 
-Each question object must contain:
+Each question must include:
 - "id": integer
-- "type": either "multiple_choice" or "open"
-- "prompt": the question text
-- "choices": an array of strings (for multiple_choice only; for open type set to null or omit)
-- "answer": for multiple_choice: the exact text of the correct choice; for open: a short model answer or keypoint summary
-- "explanation": a detailed explanation and model answer to be shown after the user answers
+- "type": "multiple_choice" or "open"
+- "prompt": question text
+- "choices": array of strings (for multiple_choice) or null/omit for open
+- "answer": for multiple_choice the exact correct choice text; for open a short model answer/keypoints
+- "explanation": detailed explanation to be shown after answering
 
-If q_type == "mix", then include a mix of types (roughly half MC and half open).
-Be concise but ensure clarity. DO NOT output anything except valid JSON (no commentary, no labels)."""
+Do not add commentary, labels, or any non-JSON text."""
     return prompt
 
 def build_grading_prompt(question: str, reference: str, student_answer: str, difficulty: str) -> str:
@@ -175,30 +149,21 @@ Difficulty: {difficulty}
 Return ONLY valid JSON like: {{ "score": <int 0-100>, "feedback": "<detailed feedback explaining strengths, weaknesses, and how to improve>" }}"""
 
 # -----------------------
-# Google Generative API interaction (robust and diagnostic)
+# Google Generative calls (tries v1 and v1beta2)
 # -----------------------
-def call_google_generate(model: str, api_key: str, prompt_text: str, max_output_tokens: int = 1024, temperature: float = 0.2, timeout: int = 60) -> Optional[str]:
-    """
-    Call Google Generative Language API (tries v1 then v1beta2 endpoints).
-    Returns generated text or None on failure. Writes diagnostics to the sidebar to help debug.
-    """
+def call_google_generate(model: str, api_key: str, prompt_text: str, max_output_tokens: int = 1024, temperature: float = 0.0, timeout: int = 60) -> Optional[str]:
+    """Call Google Generative Language API using the provided API key. Writes diagnostics to sidebar."""
     if not api_key:
         return None
 
-    # prepare model path
-    if model.startswith("models/"):
-        model_path = model
-    else:
-        model_path = f"models/{model}"
-
-    # Try both v1 and v1beta2 endpoints (some projects have different availabilities)
+    model_path = model if model.startswith("models/") else f"models/{model}"
     endpoints = [
         f"https://generativelanguage.googleapis.com/v1/{model_path}:generateText?key={api_key}",
         f"https://generativelanguage.googleapis.com/v1beta2/{model_path}:generateText?key={api_key}"
     ]
 
     last_status = None
-    last_body = None
+    last_text = None
 
     for url in endpoints:
         try:
@@ -207,83 +172,75 @@ def call_google_generate(model: str, api_key: str, prompt_text: str, max_output_
             resp = requests.post(url, headers=headers, json=body, timeout=timeout)
             status = resp.status_code
             text = resp.text
-            # Attach diagnostics to sidebar (helpful during debug)
+            last_status = status
+            last_text = text
+
+            # show diagnostics in sidebar (helpful)
             try:
-                st.sidebar.text(f"Google endpoint tried: {url}")
-                st.sidebar.text(f"Status: {status}")
-                # show a slice of the body to avoid huge UI blocks, but include full in logs
-                st.sidebar.text_area("Google raw response (truncated)", value=(text[:4000] + ("...[truncated]" if len(text) > 4000 else "")), height=220)
+                st.sidebar.markdown(f"**Google endpoint tried:** `{url}`")
+                st.sidebar.markdown(f"**HTTP status:** `{status}`")
+                st.sidebar.text_area("Raw Google response (truncated)", value=(text[:4000] + ("...[truncated]" if len(text) > 4000 else "")), height=220)
             except Exception:
-                # fallback to console prints if sidebar not available
+                # fallback: print to console
                 print("Google endpoint tried:", url)
                 print("Status:", status)
                 print("Body:", text[:2000])
 
             if not resp.ok:
-                last_status = status
-                last_body = text
-                # try next endpoint
                 continue
 
-            # parse JSON and extract text robustly
             data = resp.json()
-            # Common formats: {"candidates":[{"content":"..."}]} or {"candidates":[{"output":"..."}]} etc.
             if isinstance(data, dict):
-                # early error detection
                 if data.get("error"):
-                    last_status = status
-                    last_body = json.dumps(data)
+                    last_text = json.dumps(data)
                     continue
                 candidates = data.get("candidates") or data.get("responses") or []
                 if isinstance(candidates, list) and len(candidates) > 0:
                     first = candidates[0]
-                    # support multiple possible keys
-                    for k in ("content", "output", "text", "generated_text"):
-                        if isinstance(first, dict) and first.get(k):
-                            return first.get(k)
-                    # if first is a string
+                    if isinstance(first, dict):
+                        for k in ("content", "output", "text", "generated_text"):
+                            if first.get(k):
+                                return first.get(k)
                     if isinstance(first, str) and first.strip():
                         return first
-                # Some responses may use "response" or other shapes; try to stringify helpful parts
-                # try to find any string in the JSON recursively
-                def find_first_string(obj):
-                    if isinstance(obj, str):
-                        return obj
-                    if isinstance(obj, dict):
-                        for v in obj.values():
-                            s = find_first_string(v)
-                            if s:
-                                return s
-                    if isinstance(obj, list):
-                        for el in obj:
-                            s = find_first_string(el)
-                            if s:
-                                return s
-                    return None
-                found = find_first_string(data)
-                if found:
-                    return found
-            # fallback: return the raw text so caller can inspect
+            # fallback: find first string anywhere
+            def find_string(o):
+                if isinstance(o, str):
+                    return o
+                if isinstance(o, dict):
+                    for v in o.values():
+                        s = find_string(v)
+                        if s:
+                            return s
+                if isinstance(o, list):
+                    for e in o:
+                        s = find_string(e)
+                        if s:
+                            return s
+                return None
+            found = find_string(data)
+            if found:
+                return found
             return text
         except Exception as e:
             last_status = "exception"
-            last_body = str(e)
-            # continue to next endpoint
+            last_text = str(e)
+            try:
+                st.sidebar.error(f"Google call exception: {e}")
+            except Exception:
+                print("Google call exception:", e)
             continue
 
-    # If we reach here, both endpoints failed
+    # all endpoints tried and failed
     try:
-        st.sidebar.error(f"Google calls failed. Last status: {last_status}")
-        st.sidebar.text_area("Last Google response body (for debugging)", value=(last_body or "no body"), height=220)
+        st.sidebar.error(f"All Google endpoints failed. Last status: {last_status}")
+        st.sidebar.text_area("Last Google response body (debug)", value=(last_text or "no body"), height=220)
     except Exception:
-        print("Google calls failed. Last status:", last_status)
-        print("Last body:", last_body)
+        print("All Google endpoints failed. Last status:", last_status)
+        print("Last body:", last_text)
     return None
 
 def generate_quiz_with_google(api_key: str, context_text: str, subject: str, difficulty: str, n_questions: int, q_type: str) -> Optional[List[QuizQuestion]]:
-    """
-    Generate quiz using Google Generative API with a fixed model.
-    """
     if not api_key:
         return None
     prompt = build_generation_prompt(context_text, subject, difficulty, n_questions, q_type)
@@ -295,7 +252,7 @@ def generate_quiz_with_google(api_key: str, context_text: str, subject: str, dif
         parsed = json.loads(json_str)
         qs: List[QuizQuestion] = []
         for q in parsed.get("questions", []):
-            qid = int(q.get("id", len(qs) + 1))
+            qid = int(q.get("id", len(qs)+1))
             qtype = q.get("type", "open")
             prompt_text = q.get("prompt", "").strip()
             choices = q.get("choices", None)
@@ -306,7 +263,6 @@ def generate_quiz_with_google(api_key: str, context_text: str, subject: str, dif
             qs = qs[:n_questions]
         return qs
     except Exception:
-        # if parsing fails, write raw output into sidebar for inspection and return None
         try:
             st.sidebar.text_area("Failed to parse JSON from model output (raw):", value=text, height=300)
         except Exception:
@@ -314,10 +270,6 @@ def generate_quiz_with_google(api_key: str, context_text: str, subject: str, dif
         return None
 
 def grade_open_answer_with_google(api_key: str, question: str, reference: str, student_answer: str, difficulty: str) -> Dict[str, Any]:
-    """
-    Use Google model (fixed) to grade an open answer. Returns a dict {"score": int, "feedback": str}.
-    Falls back to simple overlap scoring on failure.
-    """
     if not api_key:
         return simple_fallback_grade(reference, student_answer)
     prompt = build_grading_prompt(question, reference, student_answer, difficulty)
@@ -331,15 +283,19 @@ def grade_open_answer_with_google(api_key: str, question: str, reference: str, s
         feedback = parsed.get("feedback", "")
         return {"score": score, "feedback": feedback}
     except Exception:
-        # fallback naive
         return simple_fallback_grade(reference, student_answer)
 
 # -----------------------
-# Streamlit UI (no API key input in UI)
+# Streamlit UI
 # -----------------------
-st.set_page_config(page_title="Quiz Generator (Gemini 2.5 Flash Lite)", layout="wide")
-st.title("Quiz Generator — fixed Google model: gemini-2.5-flash-lite — API key not requested in UI")
+st.set_page_config(page_title="Quiz Generator — Gemini (UI key)", layout="wide")
+st.title("Quiz Generator — Gemini (gemini-2.5-flash-lite)")
 
+st.sidebar.header("Google API Key (paste here)")
+st.sidebar.markdown("Paste your Google API key below. It will be used for calls to the Gemini model. If missing or invalid the app will fall back to a local fallback generator.")
+google_api_key = st.sidebar.text_input("Google API Key", type="password")
+
+st.sidebar.markdown("---")
 st.sidebar.header("Quiz Source")
 source_choice = st.sidebar.radio("Create quiz from:", ("Upload text file", "Subject / short description"))
 uploaded_text = ""
@@ -368,17 +324,28 @@ n_questions = st.sidebar.slider("Number of questions", 1, 20, 5)
 q_type = st.sidebar.selectbox("Question type", ["multiple_choice", "open", "mix"])
 randomize = st.sidebar.checkbox("Randomize question order", value=True)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("This app will try to use Google Generative API with model 'gemini-2.5-flash-lite' if a key is configured in st.secrets or the GOOGLE_API_KEY environment variable. The key is NOT requested or shown in the UI. Diagnostics from Google calls (status and raw response) will appear in the sidebar to help debug failures.")
-
-# retrieve API key securely (st.secrets -> env)
-google_api_key = None
-try:
-    google_api_key = st.secrets.get("GOOGLE_API_KEY") if hasattr(st, "secrets") else None
-except Exception:
-    google_api_key = None
-if not google_api_key:
-    google_api_key = os.environ.get("GOOGLE_API_KEY")
+# Test button to run a quick verification call
+if st.sidebar.button("Test API Key"):
+    if not google_api_key:
+        st.sidebar.error("No API key provided in the UI. Paste the key and try again.")
+    else:
+        test_prompt = 'Respond with only the JSON: {"ok": true}'
+        out = call_google_generate(GOOGLE_MODEL, google_api_key, test_prompt, max_output_tokens=64, temperature=0.0)
+        if out:
+            js = extract_json(out)
+            if js:
+                try:
+                    parsed = json.loads(js)
+                    if isinstance(parsed, dict) and parsed.get("ok") is True:
+                        st.sidebar.success("Test succeeded: model returned expected JSON.")
+                    else:
+                        st.sidebar.warning("Test returned content but not the exact JSON requested. See raw response above.")
+                except Exception:
+                    st.sidebar.warning("Received response but failed to parse JSON. See raw response above.")
+            else:
+                st.sidebar.info("Received non-JSON response from model. See raw response above.")
+        else:
+            st.sidebar.error("No response from Google. See the raw response diagnostics in the sidebar.")
 
 # Generate quiz button
 generate_button = st.sidebar.button("Generate Quiz")
@@ -401,7 +368,6 @@ if generate_button:
     else:
         with st.spinner("Generating quiz..."):
             qs: Optional[List[QuizQuestion]] = None
-            # Try Google if API key present
             if google_api_key:
                 qs = generate_quiz_with_google(google_api_key, context_text, subject, difficulty, n_questions, q_type)
                 if qs is None:
@@ -418,7 +384,7 @@ quiz = st.session_state.get("quiz")
 if quiz:
     st.header("Quiz")
     form = st.form(key="quiz_form")
-    answers = {}
+    answers: Dict[str, str] = {}
     for q in quiz:
         with st.expander(f"Question {q.id}: {q.type}", expanded=True):
             st.write(q.prompt)
@@ -508,4 +474,4 @@ if fb:
     st.button("Regenerate quiz or try again", on_click=lambda: st.session_state.update({"quiz": None, "answers": {}, "feedback": None}))
 
 st.markdown("----")
-st.write("Notes: The app attempts to call Google's Generative API with model 'gemini-2.5-flash-lite'. Diagnostics (endpoint tried, HTTP status, and a truncated raw response) will appear in the sidebar to help you see why previous calls returned 400/404. If no valid response is obtained, the internal fallback generator is used.")
+st.write("Notes: Paste your Google API key into the sidebar field. Use the 'Test API Key' button to run a minimal check (diagnostics appear in the sidebar). If Google generation fails the app falls back to a built-in generator so you can continue.")
